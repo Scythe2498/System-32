@@ -694,6 +694,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(s32_irondome.iron_dome_status())
             except Exception as e:
                 self.send_json({"error": str(e), "ports": [], "whitelist": {"ports": [], "procs": []}})
+        elif self.path == "/api/update/status":
+            try:
+                import s32_update
+                self.send_json(s32_update.status())
+            except Exception as e:
+                self.send_json({"error": str(e), "available": ""})
         elif self.path == "/api/egress/status":
             try:
                 import s32_egress
@@ -1170,6 +1176,21 @@ class Handler(BaseHTTPRequestHandler):
                     result = load_state_snapshot(fname)
                     invalidate_prompt_cache()
                     self.send_json(result)
+            except Exception as e:
+                self.send_json({"error": str(e)})
+        elif self.path in ("/api/update/check", "/api/update/apply", "/api/update/dismiss",
+                           "/api/update/rollback"):
+            try:
+                import s32_update
+                act = self.path.rsplit("/", 1)[1]
+                if act == "check":
+                    self.send_json(s32_update.check())
+                elif act == "apply":
+                    self.send_json(s32_update.apply(body.get("version", "")))
+                elif act == "dismiss":
+                    self.send_json(s32_update.dismiss(body.get("version", "")))
+                else:
+                    self.send_json(s32_update.rollback())
             except Exception as e:
                 self.send_json({"error": str(e)})
         elif self.path == "/api/egress/baseline":
@@ -2832,6 +2853,12 @@ body::after{content:'';position:fixed;inset:0;background-image:linear-gradient(r
 #app{display:flex;flex-direction:column;height:100vh;position:relative;z-index:1}
 
 /* Security banner */
+#upd-banner{display:none;flex-wrap:wrap;align-items:center;gap:10px;padding:8px 14px;background:linear-gradient(90deg,rgba(0,212,255,.14),rgba(57,255,20,.06));border-bottom:1px solid var(--accent);font-family:var(--mono);font-size:13px;z-index:49}
+#upd-banner #upd-icon{color:var(--accent);font-size:15px}
+#upd-banner button{background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:3px 10px;font-family:var(--mono);font-size:12px;cursor:pointer}
+#upd-banner button:hover{border-color:var(--accent);color:var(--accent)}
+#upd-banner #upd-go{border-color:var(--accent);color:#000;background:var(--accent);font-weight:700}
+#upd-banner #upd-notes{display:none;flex-basis:100%;margin:4px 0 2px;padding:8px 10px;max-height:220px;overflow:auto;white-space:pre-wrap;background:rgba(0,0,0,.35);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:12px}
 #sec-banner{display:none;align-items:center;gap:10px;padding:8px 14px;background:linear-gradient(90deg,rgba(255,64,96,.18),rgba(255,170,0,.10));border-bottom:1px solid var(--accent2);font-family:var(--mono);font-size:13px;z-index:50;box-shadow:0 0 18px rgba(255,64,96,.25);animation:secpulse 2.4s ease-in-out infinite}
 @keyframes secpulse{0%,100%{box-shadow:0 0 14px rgba(255,64,96,.18)}50%{box-shadow:0 0 26px rgba(255,64,96,.42)}}
 #sec-banner #sec-icon{font-size:16px;color:var(--accent2)}
@@ -3615,6 +3642,20 @@ input[type=checkbox]:focus-visible{outline:1px solid var(--k);outline-offset:2px
     </div>
   </div>
   <div id="prog"><div id="prog-bar"></div></div>
+  <div id="upd-banner">
+    <span id="upd-icon">⬆</span>
+    <span id="upd-text"></span>
+    <span id="upd-btns">
+      <button id="upd-notes-btn" onclick="updToggleNotes()">What's new</button>
+      <button id="upd-go" onclick="updApply()">Update</button>
+      <button id="upd-later" onclick="updLater()">Not now</button>
+    </span>
+    <span id="upd-roll" style="display:none">
+      <button id="upd-roll-btn" onclick="updRollback()">Roll back</button>
+      <button onclick="updHide()">OK</button>
+    </span>
+    <pre id="upd-notes"></pre>
+  </div>
   <div id="sec-banner">
     <span id="sec-icon">⚠</span>
     <span id="sec-text"></span>
@@ -3813,6 +3854,72 @@ async function poll(){
   } catch(e){}
 }
 setInterval(poll,2000); poll();
+
+// ── Update notice (s32_update): "System 32 vX is available — Update?" ──
+let _upd = null;
+async function updPoll(){
+  try{
+    const s = await fetch('/api/update/status').then(r=>r.json());
+    const b = document.getElementById('upd-banner');
+    if(s.busy) return;
+    if(s.available){
+      _upd = s;
+      document.getElementById('upd-text').textContent = `System 32 ${s.available} is available (you have ${s.current}).`;
+      document.getElementById('upd-notes').textContent = s.notes || 'No notes for this release.';
+      document.getElementById('upd-btns').style.display = 'inline-flex';
+      document.getElementById('upd-roll').style.display = 'none';
+      b.style.display = 'flex';
+    } else if(s.updated_from && s.rollback && !window._updSeen){
+      document.getElementById('upd-text').textContent = `Updated to ${s.current} (from ${s.updated_from}).`;
+      document.getElementById('upd-btns').style.display = 'none';
+      document.getElementById('upd-roll').style.display = 'inline-flex';
+      b.style.display = 'flex';
+    } else if(!window._updWorking){
+      b.style.display = 'none';
+    }
+  }catch(e){}
+}
+function updToggleNotes(){
+  const n = document.getElementById('upd-notes');
+  n.style.display = (n.style.display === 'block') ? 'none' : 'block';
+}
+function updHide(){ window._updSeen = true; document.getElementById('upd-banner').style.display = 'none'; }
+async function updLater(){
+  if(!_upd) return;
+  try{ await fetch('/api/update/dismiss',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({version:_upd.available})}); }catch(e){}
+  document.getElementById('upd-banner').style.display = 'none';
+}
+function _updWaitForRestart(msg){
+  document.getElementById('upd-text').textContent = msg;
+  document.getElementById('upd-btns').style.display = 'none';
+  document.getElementById('upd-roll').style.display = 'none';
+  setTimeout(function again(){
+    fetch('/status').then(r=>{ if(r.ok) location.reload(); else setTimeout(again, 3000); })
+                    .catch(()=>setTimeout(again, 3000));
+  }, 8000);
+}
+async function updApply(){
+  if(!_upd) return;
+  if(!confirm(`Update System 32 to ${_upd.available}?\n\nOnly System 32's own program files are replaced — your memories, settings, outputs and models stay as they are. The current files are kept so you can roll back. System 32 restarts by itself.`)) return;
+  window._updWorking = true;
+  document.getElementById('upd-text').textContent = `Updating to ${_upd.available}…`;
+  document.getElementById('upd-btns').style.display = 'none';
+  try{
+    const j = await fetch('/api/update/apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({version:_upd.available})}).then(r=>r.json());
+    if(j.ok) _updWaitForRestart(`Updated to ${j.version} — restarting…`);
+    else { window._updWorking = false; document.getElementById('upd-text').textContent = j.error || 'The update did not install.'; document.getElementById('upd-btns').style.display = 'inline-flex'; }
+  }catch(e){ window._updWorking = false; document.getElementById('upd-text').textContent = 'The update did not install: ' + e; }
+}
+async function updRollback(){
+  if(!confirm('Roll back to the version you had before this update? System 32 restarts by itself.')) return;
+  window._updWorking = true;
+  try{
+    const j = await fetch('/api/update/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}).then(r=>r.json());
+    if(j.ok) _updWaitForRestart(`Rolled back to ${j.version} — restarting…`);
+    else { window._updWorking = false; alert(j.error || 'Roll back failed.'); }
+  }catch(e){ window._updWorking = false; }
+}
+setInterval(updPoll, 300000); setTimeout(updPoll, 3000);
 
 async function secApprove(){
   const a = window._secAlert; if(!a) return;
@@ -7056,6 +7163,12 @@ def startup():
                                              f"administrator once to clear them.")
     except Exception as _ape:
         log(f"[S32] airplane mode check failed: {_ape}")
+    # Update check — one anonymous look at the GitHub repo's newest release (2026-11-01)
+    try:
+        import s32_update
+        s32_update.start()
+    except Exception as _upe:
+        log(f"[S32] Update check failed to start: {_upe}")
     # Outbound watcher — learns where each program connects; flags drift (2026-10-31)
     try:
         import s32_egress

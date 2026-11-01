@@ -17,6 +17,7 @@ System 32 chats, sees, speaks and listens. It generates images, video and 3D mod
 - [Getting started](#getting-started)
 - [Using it day to day](#using-it-day-to-day)
 - [Security: the Iron Dome](#security-the-iron-dome)
+- [Updates](#updates)
 - [Troubleshooting](#troubleshooting)
 - [License](#license)
 
@@ -194,6 +195,16 @@ It's deliberately aggressive: it's a firewall, not a toy.
 3. Open the Iron Dome panel and press **ARM**.
 
 System 32 doesn't need administrator rights for anything else, and doesn't ask for them.
+
+---
+
+## Updates
+
+Once a day, System 32 asks this GitHub repository whether there's a newer release — one anonymous request, nothing about you or your computer, and never in airplane mode. When there is one, a notice appears at the top of the chat: **What's new**, **Update** or **Not now**.
+
+**Update** replaces only System 32's own program files. Your memories, settings, outputs and models are never touched. The files it replaces are kept, and a **Roll back** button appears after the restart in case you want the old version back. System 32 restarts by itself.
+
+To turn the check off, add `"update_check": false` to `Sys 32's Home\config.json`.
 
 ---
 

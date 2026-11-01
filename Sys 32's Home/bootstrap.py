@@ -2162,7 +2162,8 @@ def main():
                         "lmstudio_model_path",
                         "lmstudio_context_length", "lmstudio_gpu_offload",
                         "lmstudio_gpu_layers", "inference_backend",
-                        "web_proxy", "web_proxy_http", "web_proxy_https"):
+                        "web_proxy", "web_proxy_http", "web_proxy_https",
+                        "update_check", "update_repo"):
                 if key in old_cfg:
                     preserved[key] = old_cfg[key]
         except Exception:

@@ -198,6 +198,7 @@ def clean_for_fresh_boot():
         "lmstudio_model_path", "lmstudio_model", "lmstudio_model_key",
         "inference_backend", "web_port", "reference_dir",
         "unreal_project", "unreal_pinned_version", "unreal_path", "unreal_version_label",
+        "web_proxy", "web_proxy_http", "web_proxy_https", "update_check", "update_repo",
     ]
     if CONFIG_FILE.exists():
         try:
@@ -357,26 +358,30 @@ def main():
 
     force = "--force" in sys.argv
     while True:
-        if not _boot_once(force):
+        why = _boot_once(force)
+        if not why:
             break
-        # A factory reset just closed System 32 — boot again from scratch, without
-        # waiting for Enter, so the open tab reloads into a true first boot.
-        print("\n  [System 32] Factory reset complete — starting fresh...\n")
+        # A factory reset or an update just closed System 32 — boot again, without
+        # waiting for Enter, so the open tab reloads into the new start.
+        print("\n  [System 32] " + ("Update installed — starting again..." if why == "update"
+                                     else "Factory reset complete — starting fresh...") + "\n")
         os.environ["S32_AUTOSTART"] = "1"
     print("\n  [System 32] Stopped.")
     input("  Press Enter to close.")
 
 
 RESET_MARK = SCRIPT_DIR / ".factory_reset_restart"
+UPDATE_MARK = SCRIPT_DIR / ".update_restart"          # s32_update: installed / rolled back
 
 
 def _boot_once(force):
     """One full boot: clean config → bootstrap → (bootstrap runs system32.py).
-    Returns True if System 32 exited because of a factory reset."""
-    try:
-        RESET_MARK.unlink()
-    except Exception:
-        pass
+    Returns "reset" / "update" if System 32 exited to be started again, else False."""
+    for _mark in (RESET_MARK, UPDATE_MARK):
+        try:
+            _mark.unlink()
+        except Exception:
+            pass
     # Always clean config and yaml for plug and play
     clean_for_fresh_boot()
     if AIRPLANE:
@@ -413,7 +418,9 @@ def _boot_once(force):
     pr("Running setup...")
     ran = run_bootstrap(python, force=force)
     if RESET_MARK.exists():
-        return True
+        return "reset"
+    if UPDATE_MARK.exists():
+        return "update"
     if not ran:
         err("System 32 stopped with an error. Check the output above for details.")
     return False

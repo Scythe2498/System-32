@@ -1,0 +1,74 @@
+# System 32 — keep the repo to System 32's own code and docs.
+# Everything below is downloaded, built or created on each machine, belongs to another
+# project, or is personal.
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Bundled / built runtimes (downloaded or built by setup)
+python/
+.venv/
+venv/
+ComfyUI/
+searxng/
+piper/
+kokoro*/
+llama-server*
+llama_build*
+*.build
+comfyui_temp*
+static/
+static_temp*
+piper_temp*
+python.zip
+.update_backup/
+.update_restart
+.update_download.zip
+*.update_part
+*.dll
+*.exe
+
+# Models and large binaries (each has its own license — never commit them)
+*.gguf
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.bin
+
+# The drive's own folders (the repo mirrors the drive's top level)
+LLM Storage/
+Sys 32's comfyui resources/
+System 32's Output/
+System 32's reference material/
+*.lnk
+
+# Per-machine and personal data
+config.json
+ui_prefs.json
+seen.json
+reference material/
+workspace/
+patches/
+.attachments/
+System32_Savepoint.md
+*.savepoint.md
+
+# Logs and run-time markers
+*.log
+.factory_reset_restart
+.pending_ytdlp_update
+_node_deps_bg.py
+
+# Workflows: a person's own workflows can embed their file paths and model names.
+# Add neutral example workflows deliberately (git add -f) rather than all of them.
+JsonFiles/
+
+# OS / editor clutter
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/
