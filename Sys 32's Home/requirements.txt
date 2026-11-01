@@ -1,0 +1,21 @@
+# System 32 — Required Packages
+# Bootstrap installs these into whatever Python ComfyUI is using.
+# Add packages here if a workflow or feature needs them.
+
+# Core — always needed
+pillow
+requests
+
+# ComfyUI integration — required for ComfyUI Desktop to start
+comfy-aimdo
+comfyui-frontend-package
+
+# Image processing
+rembg[gpu]
+opencv-python
+accelerate
+
+# Utilities
+tqdm
+psutil
+compel
