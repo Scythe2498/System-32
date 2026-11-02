@@ -20,6 +20,7 @@ System 32 chats, sees, speaks and listens. It generates images, video and 3D mod
 - [Updates](#updates)
 - [Troubleshooting](#troubleshooting)
 - [License](#license)
+- [Support System 32](#Support-System-32)
 
 ---
 
@@ -226,5 +227,13 @@ System 32 is **source-available** under the [PolyForm Noncommercial License 1.0.
 System 32 works alongside other projects that keep their own licenses — including llama.cpp (MIT), ComfyUI (GPL-3.0), SearXNG (AGPL-3.0), yt-dlp (Unlicense), Kokoro (Apache-2.0) and kokoro-onnx (MIT), Piper (MIT), and the 3D viewer (Google's model-viewer, Apache-2.0, with three.js, MIT). None of them is included in this repository: System 32 downloads each from its official source the first time it's needed. Models, voices and custom nodes each carry their own licenses as well; check them before using or sharing what you make with them.
 
 ---
+
+## Support System 32
+
+System 32 is produced and updated by an independent developer, and donations are what allows the consistent quality control necessary to keep System 32 operational for long term use.
+
+**You can support development at:**
+
+[System32 GoFundMe](https://gofund.me/936e94b6e)
 
 *Created by SoullessScythe — built over many late nights, one iteration at a time.*
