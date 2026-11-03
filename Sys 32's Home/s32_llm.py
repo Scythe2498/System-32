@@ -349,6 +349,99 @@ def _web_lookup_rule():
 
 
 def build_system_prompt():
+    """Wraps the build for the input-area bar (2026-11-02). When the prompt is REBUILT, the bar
+    runs from 'Rebuilding system prompt' until the model starts answering — the model reading
+    the whole new prompt is the real wait ('settling in'). The first one after each model load
+    is timed (per computer + model + settings) so later boots show a real estimate."""
+    state["_prompt_rebuilt"] = False
+    try:
+        text = _build_system_prompt()
+    except Exception:
+        state["load_prompt"] = None
+        raise
+    if state.pop("_prompt_rebuilt", False):
+        _start_settle()
+    return text
+
+
+def _prompt_step(n, what):
+    """Progress for the input-area bar while the prompt is rebuilt (system32.py shows it)."""
+    if n == 0 and not state.get("_prompt_rebuilt"):      # once per rebuild: the clock starts here
+        state["_prompt_rebuilt"] = True
+        state["load_prompt"] = {"started": time.time(), "phase": "build", "expect": _settle_expect()}
+    lp = state.get("load_prompt") or {"started": time.time(), "phase": "build"}
+    lp.update(step=n, steps=5, what=what)
+    state["load_prompt"] = lp
+
+
+def _wait_for_comfy(limit=120):
+    """ComfyUI still starting → wait for it (2026-11-02). Built too early, the prompt lists 0
+    checkpoints, and the next message sees them appear and rebuilds the WHOLE prompt again
+    (the model re-reads all of it: minutes). Only waits while a ComfyUI launch is running."""
+    try:
+        from s32_comfyui import _comfy_start_lock
+    except Exception:
+        return
+    if state.get("comfy_image_ready") or not _comfy_start_lock.locked():
+        return
+    log("[S32][PROMPT] ComfyUI is still starting — waiting for it so the model list is complete")
+    _prompt_step(0, "waiting for ComfyUI to start")
+    t0 = time.time()
+    while time.time() - t0 < limit and _comfy_start_lock.locked() and not state.get("comfy_image_ready"):
+        time.sleep(1)
+    _prompt_step(0, "checkpoints")
+
+
+def _settle_key():
+    k = state.get("load_key")
+    return (k + "|settle") if k else ""
+
+
+def _settle_expect():
+    try:
+        from s32_hardware import _expected_load
+        k = _settle_key()
+        return _expected_load(k) if k else 0
+    except Exception:
+        return 0
+
+
+def _start_settle():
+    """Rebuilt → the model now reads it; the bar stays until its first token (s32_config)."""
+    lp = state.get("load_prompt") or {"started": time.time()}
+    lp.update(phase="reading", what="reading the new prompt")
+    lp["record"] = bool(state.pop("settle_first", False))
+    lp["key"] = _settle_key()
+    state["load_prompt"] = lp
+    state["on_first_token"] = _settle_done
+
+
+def _settle_done():
+    """The model started answering: keep the time (first after a load) and clear the bar."""
+    lp = state.get("load_prompt")
+    state["load_prompt"] = None
+    if lp and lp.get("phase") == "reading" and lp.get("record") and lp.get("key"):
+        secs = time.time() - lp.get("started", time.time())
+        try:
+            from s32_hardware import _remember_load
+            _remember_load(lp["key"], secs)
+        except Exception:
+            pass
+        log(f"[S32][PROMPT] Settled in: {secs:.0f}s from rebuilding the prompt to the first answer "
+            f"(kept for next time)")
+
+
+def _settle_clear():
+    """The request ended without an answer (error / stopped) — no time kept, no bar left."""
+    state.pop("on_first_token", None)
+    lp = state.get("load_prompt")
+    if lp and lp.get("phase") == "reading":
+        state["load_prompt"] = None
+        if lp.get("record"):
+            state["settle_first"] = True        # time the next one instead
+
+
+def _build_system_prompt():
     now = time.time()
     # If prompt is locked (active conversation) return cached version
     if _prompt_cache["locked"] and _prompt_cache["text"]:
@@ -365,6 +458,8 @@ def build_system_prompt():
     log("[S32][PROMPT] Rebuilding system prompt...")
 
     # Try to fetch live data - fall back to cached text if ComfyUI is busy
+    _prompt_step(0, "checkpoints")
+    _wait_for_comfy()
     log("[S32][PROMPT] Fetching checkpoints...")
     try:
         checkpoints = fetch_checkpoints()
@@ -372,6 +467,7 @@ def build_system_prompt():
         checkpoints = []
     log(f"[S32][PROMPT] Checkpoints done: {len(checkpoints)}")
 
+    _prompt_step(1, "LoRAs")
     log("[S32][PROMPT] Fetching loras...")
     try:
         loras = fetch_lora_options()
@@ -379,6 +475,7 @@ def build_system_prompt():
         loras = []
     log(f"[S32][PROMPT] Loras done: {len(loras)}")
 
+    _prompt_step(2, "datasets")
     log("[S32][PROMPT] Fetching datasets...")
     try:
         datasets = fetch_datasets()
@@ -386,6 +483,7 @@ def build_system_prompt():
         datasets = []
     log(f"[S32][PROMPT] Datasets done: {len(datasets)}")
 
+    _prompt_step(3, "workflows")
     log("[S32][PROMPT] Scanning workflows...")
     try:
         wf_lines = []
@@ -415,6 +513,7 @@ def build_system_prompt():
         wf_summary = "  (could not read workflow folder)"
     log(f"[S32][PROMPT] Workflows done: {len(wf_lines)}")
 
+    _prompt_step(4, "putting it together")
     hw   = get_hardware()
     tier = hw.get("tier", "mid")
     ctx  = hardware_context_length(hw)
@@ -1055,12 +1154,15 @@ def chat(user_text, image_b64=None, on_delta=None, auto_vision=True, no_tools=Fa
     last_body = ""
     for attempt in range(5):
         try:
-            resp = cancellable_post_stream(
-                f"{CONFIG['lmstudio_host']}/v1/chat/completions",
-                payload,
-                timeout=300,
-                on_delta=on_delta
-            )
+            try:
+                resp = cancellable_post_stream(
+                    f"{CONFIG['lmstudio_host']}/v1/chat/completions",
+                    payload,
+                    timeout=300,
+                    on_delta=on_delta
+                )
+            finally:
+                _settle_clear()      # the 'settling in' bar never outlives the request
             break  # success
         except GenerationCancelled:
             raise  # user stopped this turn — do not retry, let the caller handle it
@@ -1406,11 +1508,14 @@ def chat_followup(user_text, tool_name, tool_result_summary):
     last_err = None
     for attempt in range(3):
         try:
-            resp = http_post(
-                f"{CONFIG['lmstudio_host']}/v1/chat/completions",
-                payload,
-                timeout=120
-            )
+            try:
+                resp = http_post(
+                    f"{CONFIG['lmstudio_host']}/v1/chat/completions",
+                    payload,
+                    timeout=120
+                )
+            finally:
+                _settle_clear()      # not streamed: no first-token signal, so no bar left behind
             choice  = resp["choices"][0]
             message = choice["message"]
             spoken  = (message.get("content") or "").strip()

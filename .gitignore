@@ -21,6 +21,9 @@ comfyui_temp*
 static/
 static_temp*
 piper_temp*
+cudart_temp*
+vulkan_temp*
+llama_temp*
 python.zip
 .update_backup/
 .update_restart

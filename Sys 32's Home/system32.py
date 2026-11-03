@@ -123,6 +123,49 @@ def _set_airplane(on):
     return res
 
 
+def _loading_bar():
+    """The input-area bar for waits that aren't downloads (2026-11-02): the model loading
+    (timed against how long it took last time on this computer) and the system prompt
+    being rebuilt (5 real steps). None when there's nothing to show."""
+    now = time.time()
+    lm = state.get("load_model")
+    if lm:
+        el = max(0, now - lm.get("started", now))
+        exp = lm.get("expect") or 0
+        name = lm.get("name") or "the model"
+        if not exp:          # first load of this model on this computer — nothing to time against
+            return {"kind": "model", "pct": None,
+                    "label": f"⬡ Loading {name} — {int(el)}s  · first load here, timing it for next time"}
+        left = exp - el
+        pct = min(95, int(el * 100 / exp))      # never 'done' until it actually answers
+        tail = f"about {round(left)}s left" if left >= 1.5 else "almost ready…"
+        return {"kind": "model", "pct": pct, "label": f"⬡ Loading {name} — {pct}%  · {tail}"}
+    lp = state.get("load_prompt")
+    if lp and now - lp.get("started", now) >= 0.8:     # a quick refresh isn't worth a flash
+        # From 'Rebuilding system prompt' until the model starts answering (s32_llm): the
+        # rebuild steps, then the model reading the new prompt ('settling in'). Timed after
+        # each model load, so later boots get a real estimate.
+        el = now - lp.get("started", now)
+        exp = lp.get("expect") or 0
+        reading = lp.get("phase") == "reading"
+        if reading and el > max(900, 3 * exp):          # safety: never a stuck bar
+            return None
+        if exp:
+            pct = min(95, int(el * 100 / exp))
+            left = exp - el
+            tail = f"about {round(left)}s left" if left >= 1.5 else "almost ready…"
+            what = "reading the new prompt" if reading else f"refreshing — {lp.get('what', '')}"
+            return {"kind": "prompt", "pct": pct, "label": f"↻ Settling in — {what} — {pct}%  · {tail}"}
+        if reading:
+            tail = ("  · first time here, timing it for next time" if lp.get("record") else "")
+            return {"kind": "prompt", "pct": None,
+                    "label": f"↻ Settling in — reading the new prompt — {int(el)}s{tail}"}
+        n, of = lp.get("step", 0), lp.get("steps", 5)
+        return {"kind": "prompt", "pct": int(n * 100 / of),
+                "label": f"↻ Refreshing the system prompt — {lp.get('what', '')} ({n + 1} of {of})"}
+    return None
+
+
 def _fop_key(tool, params):
     """Repeat-breaker identity for file_operation: WHAT it acts on. It has no path/query/folder/
     name, so every call looked identical and a corrected retry (2026-10-30: desktop\\… → C:\\…)
@@ -718,12 +761,24 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(s32_irondome.compute_close_plan())
             except Exception as e:
                 self.send_json({"error": str(e), "close_ports": [], "close_procs": []})
+        elif self.path == "/api/gpus":
+            try:
+                import s32_hardware
+                self.send_json({"cards": [{"id": c["id"], "name": c["name"], "total": c["total"]}
+                                          for c in s32_hardware.usable_gpus()]})
+            except Exception as e:
+                self.send_json({"cards": [], "error": str(e)})
         elif self.path == "/api/downloads":
             try:
                 import s32_download
-                self.send_json(s32_download.downloads_status())
+                d = s32_download.downloads_status()
             except Exception as e:
-                self.send_json({"active": [], "queued": [], "restarting": False, "error": str(e)})
+                d = {"active": [], "queued": [], "restarting": False, "error": str(e)}
+            try:
+                d["loading"] = _loading_bar()
+            except Exception:
+                d["loading"] = None
+            self.send_json(d)
         elif self.path == "/api/tuning":
             try:
                 import s32_llm
@@ -1349,6 +1404,9 @@ class Handler(BaseHTTPRequestHandler):
                 elif what == "batch":
                     import s32_comfyui
                     out = s32_comfyui.cancel_comfy_jobs("input bar")
+                elif what == "model":                     # the model loading bar (2026-11-02)
+                    import s32_hardware
+                    out = s32_hardware.cancel_llama_load()
             except Exception as e:
                 out = {"error": str(e)}
             self.send_json(out)
@@ -2712,6 +2770,14 @@ class Handler(BaseHTTPRequestHandler):
                         defaults.update(all_s[key])
             except Exception:
                 pass
+            # The model's own limits (2026-11-02) — so the panel caps the CURRENT model's
+            # fields too, not only a newly browsed one.
+            try:
+                from s32_hardware import read_gguf_caps
+                defaults["caps"] = read_gguf_caps(model_path) if model_path and os.path.exists(model_path) else {}
+            except Exception:
+                defaults["caps"] = {}
+            defaults["cpu_threads"] = os.cpu_count() or 0
             self.send_json(defaults)
             return
 
@@ -3305,6 +3371,10 @@ input[type=checkbox]:focus-visible{outline:1px solid var(--k);outline-offset:2px
             <option value="0">Off</option>
             <option value="1">On</option>
           </select>
+        </div>
+        <div id="model-gpus-row" style="grid-column:1/3;display:none">
+          <div style="font-size:10px;color:var(--muted);margin-bottom:3px">GRAPHICS CARDS <span style="opacity:.75">· split across the ones on · all off = CPU</span></div>
+          <div id="model-gpus-list"></div>
         </div>
       </div>
       <button onclick="openCat('tuning')" style="width:100%;margin-bottom:8px;background:var(--bg3);color:var(--accent);border:1px solid var(--accent);border-radius:4px;padding:7px;font-size:12px;cursor:pointer;font-weight:700;letter-spacing:1px">&#127899; MODEL TUNING</button>
@@ -4363,7 +4433,12 @@ async function pollDownloads(){
   let d;
   try{ d = await fetch('/api/downloads').then(r=>r.json()); }catch(e){ return; }
   const act = d.active||[], q = d.queued||[], bt = d.batch||null;
-  const on = act.length>0 || q.length>0 || !!d.restarting || !!bt;
+  // Model loading / system prompt refresh share the bar (2026-11-02). The model comes
+  // first (nothing can be asked until it's up); the prompt refresh only when nothing else shows.
+  const ld = d.loading||null;
+  const busy = act.length>0 || q.length>0 || !!d.restarting || !!bt;
+  const lshow = ld && (ld.kind==='model' || !busy) ? ld : null;
+  const on = busy || !!lshow;
   const xb = document.getElementById('dl-x');
   const bar=document.getElementById('dl-bar'), fill=document.getElementById('dl-fill'),
         txt=document.getElementById('dl-text'), inp=document.getElementById('msg-in'),
@@ -4371,7 +4446,9 @@ async function pollDownloads(){
   if(!bar) return;
   if(on){
     let label, pct=null;
-    if(act.length){
+    if(lshow){
+      label=lshow.label; pct=(lshow.pct===null||lshow.pct===undefined) ? null : lshow.pct;
+    } else if(act.length){
       const a=act[0];
       if(a.total){ pct=Math.min(100, Math.floor(a.got*100/a.total));
         label=`⬇ Downloading ${a.name} — ${pct}%  (${_fmtB(a.got)} / ${_fmtB(a.total)})`; }
@@ -4390,7 +4467,7 @@ async function pollDownloads(){
     }
     // ✕ cancels what the bar shows: downloads (+ queue) first, else its batch.
     // No ✕ mid-restart — stopping ComfyUI halfway would leave it down.
-    const what = (act.length||q.length) ? 'downloads' : (d.restarting ? '' : 'batch');
+    const what = lshow ? (lshow.kind==='model' ? 'model' : '') : (act.length||q.length) ? 'downloads' : (d.restarting ? '' : 'batch');
     if(xb){ xb.style.display = what ? '' : 'none';
             if(xb.dataset.what !== what){ xb.dataset.what = what; xb.disabled = false; } }
     txt.textContent=label; bar.title=label;
@@ -4410,8 +4487,9 @@ async function pollDownloads(){
 async function cancelActivity(){
   const xb=document.getElementById('dl-x'); if(!xb || !xb.dataset.what) return;
   xb.disabled=true;   // re-enabled if the bar moves on to something else
-  try{ await fetch('/api/activity/cancel',{method:'POST',headers:{'Content-Type':'application/json'},
-       body:JSON.stringify({what: xb.dataset.what})}); }catch(e){}
+  try{ const j = await fetch('/api/activity/cancel',{method:'POST',headers:{'Content-Type':'application/json'},
+       body:JSON.stringify({what: xb.dataset.what})}).then(r=>r.json());
+       if(j && j.msg) addMsg('sys', j.msg); }catch(e){}
 }
 setInterval(pollDownloads, 1000); pollDownloads();
 
@@ -5400,7 +5478,7 @@ function openCat(key){
   try {
     if(key === 'model'){
       _selectedModelPath = '';
-      const ms = document.getElementById('model-status'); if(ms) ms.textContent = 'Browse to select a model file.';
+      const ms = document.getElementById('model-status'); if(ms) ms.textContent = 'Browse to select a model file, or change a setting.';
       const btn = document.getElementById('model-load-btn'); if(btn){ btn.disabled = true; btn.style.opacity = '0.4'; }
       loadCurrentModelSettings();
       refreshModelCurrent();
@@ -5520,7 +5598,91 @@ function toggleVisionMode(){
 }
 function onVisionFps(v){ const fv = document.getElementById('vision-fps-val'); if(fv) fv.textContent = v; }
 function commitVisionFps(v){ _visionSet({fps: parseInt(v,10)}); }
+// Graphics cards (2026-11-02): one switch per card this computer has. Saved per model as the
+// NAMES of the cards that are on ("gpus_on") so the choice travels with the drive. No saved
+// choice (or another computer's cards) → the best card only, as before.
+let _gpuCards = null, _gpuPref = null, _gpusFetching = false;
+async function refreshGpus(){
+  if(_gpuCards || _gpusFetching) return; _gpusFetching = true;
+  try{ const d = await fetch('/api/gpus').then(r=>r.json()); _gpuCards = d.cards||[]; _renderGpus(); }
+  catch(e){} finally{ _gpusFetching = false; }
+}
+function _setGpuPref(sd){
+  _gpuPref = Array.isArray(sd && sd.gpus_on) ? sd.gpus_on : ((sd && sd.gpus === 'all') ? 'all' : null);
+  _renderGpus();
+}
+function _renderGpus(){
+  const row = document.getElementById('model-gpus-row'), list = document.getElementById('model-gpus-list');
+  if(!row || !list) return;
+  if(!_gpuCards || !_gpuCards.length){ row.style.display = 'none'; return; }
+  const low = _gpuCards.map(c => c.name.toLowerCase());
+  let on;
+  if(_gpuPref === 'all') on = new Set(low);
+  else if(Array.isArray(_gpuPref)){
+    const p = _gpuPref.map(n => String(n).toLowerCase());
+    on = new Set(low.filter(n => p.includes(n)));
+    if(p.length && !on.size) on = new Set([low[0]]);      // another computer's cards
+  } else on = new Set([low[0]]);
+  const short = n => n.replace(/^(NVIDIA|AMD)\s+/i,'').replace(/^(GeForce|Radeon)\s+/i,'');
+  list.innerHTML = '';
+  _gpuCards.forEach((c, i) => {
+    const lab = document.createElement('label');
+    lab.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:8px;padding:4px 8px;margin-bottom:4px;background:var(--bg3);border:1px solid var(--border);border-radius:4px;font-size:12px;color:var(--fg);cursor:pointer';
+    const nm = document.createElement('span');
+    nm.textContent = short(c.name);
+    const gb = document.createElement('span');
+    gb.style.cssText = 'color:var(--muted);font-size:10px;margin-left:6px';
+    gb.textContent = c.total ? Math.round(c.total/1024) + ' GB' : '';
+    nm.appendChild(gb);
+    const cb = document.createElement('input'); cb.type = 'checkbox'; cb.dataset.gpu = c.name;
+    cb.checked = on.has(low[i]); cb.title = c.name;
+    lab.appendChild(nm); lab.appendChild(cb); list.appendChild(lab);
+  });
+  row.style.display = '';
+  _snapIfUntouched();
+}
+function _gpusOn(){
+  if(!_gpuCards || !_gpuCards.length) return null;
+  return [...document.querySelectorAll('#model-gpus-list input[type=checkbox]')].filter(c => c.checked).map(c => c.dataset.gpu);
+}
+
+// Load button (2026-11-02): lit when a new model is picked, OR when the current model's
+// settings were changed — Load then reloads the current model with the new settings.
+let _panelSnap = null, _panelTouched = false;
+function _panelState(){
+  const v = id => (document.getElementById(id)||{}).value;
+  return JSON.stringify([v('model-ctx'), v('model-gpu-layers'), v('model-threads'), v('model-batch'),
+                         v('model-kv'), v('model-flash'), _gpusOn()]);
+}
+function _snapIfUntouched(){ if(!_panelTouched){ _panelSnap = _panelState(); } _updateLoadBtn(); }
+function _updateLoadBtn(){
+  const btn = document.getElementById('model-load-btn'); if(!btn) return;
+  const changed = _panelSnap !== null && _panelState() !== _panelSnap;
+  const ok = !_modelSwitching && (!!_selectedModelPath || (!!window._currentModelPath && changed));
+  btn.disabled = !ok; btn.style.opacity = ok ? '1' : '0.4';
+  const ms = document.getElementById('model-status');
+  if(ms && !_selectedModelPath && !_modelSwitching)
+    ms.textContent = changed ? 'New settings — press Load to reload the model with them.'
+                             : 'Browse to select a model file, or change a setting.';
+}
+function _fillModelSettings(sd){
+  if(!sd) return;
+  if(sd.ctx_size)    document.getElementById('model-ctx').value        = sd.ctx_size;
+  if(sd.gpu_layers !== undefined) document.getElementById('model-gpu-layers').value = sd.gpu_layers;
+  if(sd.threads)     document.getElementById('model-threads').value    = sd.threads;
+  if(sd.batch_size)  document.getElementById('model-batch').value      = sd.batch_size;
+  if(sd.kv_cache)    document.getElementById('model-kv').value          = sd.kv_cache;
+  document.getElementById('model-flash').value = sd.flash_attn ? '1' : '0';
+  _setGpuPref(sd);
+}
+['input','change'].forEach(ev => document.addEventListener(ev, e => {
+  if(e.target && e.target.closest && e.target.closest('#cat-model') && e.target.matches('input,select')){
+    if(ev === 'change') _clampField(e.target);       // on Enter / leaving the box
+    _panelTouched = true; _updateLoadBtn();
+  }
+}));
 async function refreshModelCurrent(){
+  refreshGpus();
   const cur = document.getElementById('model-current'); if(!cur) return;
   try{
     const r = await fetch('/status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
@@ -5547,15 +5709,20 @@ function startCatDrag(e, id){
 }
 // ── Settings panel functions ──────────────────────────────────────────────────
 async function loadCurrentModelSettings(){
+  // The panel opens on the CURRENT model's saved settings, so changing one and pressing Load
+  // reloads it with them (2026-11-02).
+  _panelTouched = false; _panelSnap = null; _updateLoadBtn();
   try {
-    const r = await fetch('/status');
-    const d = await r.json();
-    if(d.ctx_size)    document.getElementById('model-ctx').value = d.ctx_size;
-    if(d.gpu_layers !== undefined) document.getElementById('model-gpu-layers').value = d.gpu_layers;
-    if(d.model_path){
-      const parts = d.model_path.replace(/\\/g,'/').split('/');
-      document.getElementById('model-selected').value = parts[parts.length-1] || d.model_path;
-    }
+    const d = await fetch('/status').then(r => r.json());
+    if(d.model_path) window._currentModelPath = d.model_path;
+    const path = d.model_path || window._currentModelPath || '';
+    if(!path) return;
+    const sd = await fetch('/get_model_settings',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({model_path:path})}).then(r => r.json());
+    if(_selectedModelPath || _panelTouched) return;      // they browsed / started editing meanwhile
+    _fillModelSettings(sd);
+    applyModelCaps(sd);         // the current model's limits too (2026-11-02)
+    _snapIfUntouched();
   } catch(e){}
 }
 
@@ -6664,12 +6831,7 @@ async function browseModelFile(){
         headers:{'Content-Type':'application/json'},
         body:JSON.stringify({model_path:d.path})});
       const sd = await sr.json();
-      if(sd.ctx_size)    document.getElementById('model-ctx').value        = sd.ctx_size;
-      if(sd.gpu_layers !== undefined) document.getElementById('model-gpu-layers').value = sd.gpu_layers;
-      if(sd.threads)     document.getElementById('model-threads').value    = sd.threads;
-      if(sd.batch_size)  document.getElementById('model-batch').value      = sd.batch_size;
-      if(sd.kv_cache)    document.getElementById('model-kv').value          = sd.kv_cache;
-      document.getElementById('model-flash').value = sd.flash_attn ? '1' : '0';
+      _fillModelSettings(sd);
     } catch(e){}
     applyModelCaps(d);   // cap ctx/gpu/threads to what THIS model + CPU can do (clamps saved values too)
   } catch(e){
@@ -6677,11 +6839,20 @@ async function browseModelFile(){
     document.getElementById('model-status').textContent = 'Error: ' + e.message;
   }
 }
+const _FIELD_MAX = {'model-ctx':262144, 'model-gpu-layers':200, 'model-threads':64, 'model-batch':4096};
 function _clampInput(id, maxv){
   const el = document.getElementById(id);
-  if(!el || !maxv || maxv <= 0) return;
-  el.max = maxv;
-  if(parseFloat(el.value) > maxv) el.value = maxv;
+  if(!el) return;
+  el.max = (maxv && maxv > 0) ? maxv : (_FIELD_MAX[id] || el.max);   // no stale cap from another model
+  _clampField(el);
+}
+function _clampField(el){
+  // A typed number past the limit is pulled back (the arrows already stop there) — 2026-11-02.
+  if(!el || el.type !== 'number' || el.value === '') return;
+  const v = parseFloat(el.value), mx = parseFloat(el.max), mn = parseFloat(el.min);
+  if(isNaN(v)) return;
+  if(!isNaN(mx) && v > mx) el.value = mx;
+  else if(!isNaN(mn) && v < mn) el.value = mn;
 }
 function _capLabel(id, base, maxv){
   const el = document.getElementById(id);
@@ -6706,12 +6877,16 @@ function applyModelCaps(d){
   _capLabel('model-threads-lbl', 'THREADS', cpu);
 }
 async function loadSelectedModel(){
-  if(!_selectedModelPath || _modelSwitching) return;
+  // A picked model, else the current one with the panel's (changed) settings.
+  const path = _selectedModelPath || window._currentModelPath || '';
+  if(!path || _modelSwitching) return;
+  const sameModel = !_selectedModelPath;
+  ['model-ctx','model-gpu-layers','model-threads','model-batch'].forEach(id => _clampField(document.getElementById(id)));
   _modelSwitching = true;
   const btn = document.getElementById('model-load-btn');
   if(btn){ btn.disabled = true; btn.style.opacity = '0.4'; }
-  const fname = _selectedModelPath.split('\\').pop().split('/').pop();
-  document.getElementById('model-status').textContent = 'Switching to ' + fname + '...';
+  const fname = path.split('\\').pop().split('/').pop();
+  document.getElementById('model-status').textContent = (sameModel ? 'Reloading ' + fname + ' with the new settings' : 'Switching to ' + fname) + '...';
   _lmWasReady = false;
   const stxt = document.getElementById('status-txt');
   if(stxt) stxt.textContent = '⬡ system 32 — switching model...';
@@ -6724,20 +6899,21 @@ async function loadSelectedModel(){
     const flash     = ((document.getElementById('model-flash')||{}).value || '0') === '1';
     // Save settings for this model first, then switch
     const settings = {ctx_size:ctx, gpu_layers:gpuLayers, threads:threads, batch_size:batch, kv_cache:kv, flash_attn:flash};
+    const gpusOn = _gpusOn(); if(gpusOn) settings.gpus_on = gpusOn;
     await fetch('/save_model_settings',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({model_path:_selectedModelPath, settings:settings})}).catch(()=>{});
+      body:JSON.stringify({model_path:path, settings:settings})}).catch(()=>{});
     const r = await fetch('/set_model',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({model_id:_selectedModelPath, context_length:ctx, gpu_layers:gpuLayers,
+      body:JSON.stringify({model_id:path, context_length:ctx, gpu_layers:gpuLayers,
         threads:threads, batch_size:batch, kv_cache:kv, flash_attn:flash})});
     const d = await r.json();
     if(d.error){
       document.getElementById('model-status').textContent = 'Error: ' + d.error;
-      _modelSwitching = false;
+      _modelSwitching = false; _updateLoadBtn();
       return;
     }
-    window._currentModelPath = _selectedModelPath;
-    document.getElementById('model-status').textContent = 'Switching — ' + fname;
-    setTimeout(()=>{ closeModelPicker(); _modelSwitching = false; }, 2000);
+    window._currentModelPath = path; _selectedModelPath = '';
+    document.getElementById('model-status').textContent = (sameModel ? 'Reloading — ' : 'Switching — ') + fname;
+    setTimeout(()=>{ closeModelPicker(); _modelSwitching = false; _updateLoadBtn(); }, 2000);
   } catch(e){
     document.getElementById('model-status').textContent = 'Error: ' + e.message;
     _modelSwitching = false;

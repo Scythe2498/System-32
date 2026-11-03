@@ -796,6 +796,184 @@ def _flash_attn_args(server):
     return ["--flash-attn", "on"] if _flash_syntax else ["--flash-attn"]
 
 
+# ── Model loading bar (2026-11-02) ───────────────────────────────────────────
+# llama-server gives no percentage while it loads, so System 32 times each load and
+# remembers it (per computer + model + settings — the same drive loads at different
+# speeds on different machines). The input-area bar fills against that time; the very
+# first load of a model on a computer has nothing to go on, so its bar just moves.
+# Kept in reference material: local to this drive, never in the repo.
+def _load_times_path():
+    return os.path.join(REFERENCE_DIR or os.path.dirname(os.path.abspath(__file__)),
+                        "model_load_times.json")
+
+
+def _load_key(model_path, ctx, gpu_layers, kv_cache, mmproj):
+    return "|".join([str(_machine_name or "?"), os.path.basename(model_path).lower(),
+                     str(ctx), str(gpu_layers), str(kv_cache or "f16"), "vision" if mmproj else ""])
+
+
+def _expected_load(key):
+    try:
+        with open(_load_times_path(), encoding="utf-8") as f:
+            times = json.load(f).get(key) or []
+        return sum(times) / len(times) if times else 0
+    except Exception:
+        return 0
+
+
+def _remember_load(key, secs):
+    try:
+        p = _load_times_path()
+        try:
+            with open(p, encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception:
+            d = {}
+        d[key] = ((d.get(key) or []) + [round(secs, 1)])[-3:]     # the last 3 loads
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=1)
+    except Exception:
+        pass
+
+
+# ── Graphics cards (2026-11-02) ──────────────────────────────────────────────
+# llama-server's graphics backends are add-on DLLs next to it: ggml-cuda.dll (NVIDIA) and
+# ggml-vulkan.dll (Vulkan — AMD, and NVIDIA again). With the Vulkan add-on present, an
+# NVIDIA card is listed TWICE (CUDA0 and VulkanN), so System 32 always names the cards.
+# Per model, the operator switches each card on or off (model panel → GRAPHICS CARDS); the
+# setting is the NAMES of the cards that are on ("gpus_on"), so it travels with the drive:
+#   no setting yet / none of the names on this computer → the single best card (NVIDIA via
+#                      CUDA, else a discrete Vulkan card)
+#   one or more on   → those cards, the model split across them by free memory
+#   all off ([])     → the CPU only (--device none)
+# Built-in graphics (Intel, AMD 'Radeon(TM) Graphics' APUs, software renderers) are never used.
+# A CUDA-only build with no setting adds nothing to the command — exactly the old behaviour.
+_DEV_RE = re.compile(r"^\s*((?:CUDA|Vulkan|ROCm|SYCL)\d+):\s*(.+?)\s*\((\d+)\s*MiB,\s*(\d+)\s*MiB free\)")
+_BUILTIN_RE = re.compile(r"intel|microsoft|llvmpipe|swiftshader|\(tm\) graphics|^amd radeon graphics$", re.I)
+_devices_cache = {}
+
+
+def _list_devices(server):
+    """[{id, name, total, free}] from `llama-server --list-devices` (cached per server)."""
+    if server in _devices_cache:
+        return _devices_cache[server]
+    out = []
+    try:
+        r = subprocess.run([server, "--list-devices"], capture_output=True, text=True, timeout=30,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        for line in (r.stdout or "").splitlines() + (r.stderr or "").splitlines():
+            m = _DEV_RE.match(line)
+            if m and not any(d["id"] == m.group(1) for d in out):
+                out.append({"id": m.group(1), "name": m.group(2), "total": int(m.group(3)),
+                            "free": int(m.group(4))})
+    except Exception as e:
+        log(f"[S32] Couldn't list graphics cards: {e}")
+    _devices_cache[server] = out
+    return out
+
+
+def usable_gpus(server=None):
+    """Each discrete card once, best first: NVIDIA via CUDA, then the rest via Vulkan."""
+    server = server or _find_llama_server()
+    if not server:
+        return []
+    devs = _list_devices(server)
+    cuda = [d for d in devs if d["id"].startswith("CUDA")]
+    names = {d["name"].lower() for d in cuda}
+    rest = [d for d in devs if not d["id"].startswith("CUDA")
+            and d["name"].lower() not in names and not _BUILTIN_RE.search(d["name"])]
+    return cuda + rest
+
+
+def _pick_cards(cards, gpus):
+    """→ the cards to use, given the model's setting (see the block comment above)."""
+    if gpus == "all":                                    # the earlier One/All setting
+        return cards
+    if isinstance(gpus, list):
+        names = {str(n).lower() for n in gpus}
+        if not names:
+            return []                                    # all switched off → CPU
+        on = [c for c in cards if c["name"].lower() in names]
+        if on:
+            return on
+    return cards[:1]                                     # default / another computer's cards
+
+
+def _device_args(server, gpus):
+    vulkan = os.path.exists(os.path.join(os.path.dirname(os.path.abspath(server)), "ggml-vulkan.dll"))
+    if not vulkan and not isinstance(gpus, list):
+        return []                                        # CUDA-only build, no setting — as before
+    cards = usable_gpus(server)
+    pick = _pick_cards(cards, gpus)
+    if not pick:
+        log("[S32] Graphics cards all switched off (or none found) — running the model on the CPU.")
+        return ["--device", "none"]
+    if len(pick) > 1:
+        free = [max(1, c["free"]) for c in pick]
+        split = ",".join(str(round(f * 100 / sum(free))) for f in free)
+        log("[S32] Graphics cards: " + " + ".join(f"{c['name']} ({c['id']})" for c in pick)
+            + f" — model split {split.replace(',', '/')}")
+        return ["--device", ",".join(c["id"] for c in pick), "--tensor-split", split]
+    log(f"[S32] Graphics card: {pick[0]['name']} ({pick[0]['id']})")
+    return ["--device", pick[0]["id"]]
+
+
+def cancel_llama_load():
+    """The ✕ on the model loading bar (2026-11-02): stop a load that's taking too long or has
+    hung. The wait loop sees the cancel and stops quietly; the model panel can load again."""
+    lm = state.get("load_model")
+    if not lm:
+        return {"error": "No model is loading."}
+    gen = lm.get("gen")
+    state["llama_cancel"] = gen
+    state["load_model"] = None
+    proc = _llama_proc.get("proc")
+    try:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+    except Exception:
+        pass
+    try:
+        host = CONFIG.get("lmstudio_host", "http://localhost:1234")
+        _kill_llama_on_port(int(host.split(":")[-1]) if ":" in host else 1234)
+    except Exception:
+        pass
+    state["model_switching"] = False
+    state["model_load_failed"] = True      # nothing loaded: chat says so, ComfyUI waits
+    state["lmstudio_ready"] = True         # the UI stays usable so another load can start
+    log(f"[S32] Model loading cancelled ({lm.get('name', 'model')}).")
+    return {"ok": True, "msg": f"Loading {lm.get('name', 'the model')} was cancelled. Open model "
+                               f"switching to change its settings or pick another model, then press Load."}
+
+
+_llama_proc = {}
+
+
+def _check_gpu_used(log_path, gpu_layers):
+    """After a load (2026-11-02): an NVIDIA computer whose llama-server log never mentions
+    CUDA is running the model on the CPU — llama-server doesn't say so itself. Say it
+    plainly, once, with the fix."""
+    try:
+        if not gpu_layers or int(gpu_layers) <= 0:
+            return                                        # CPU on purpose
+        if "nvidia" not in str(get_hardware().get("gpu_name", "")).lower():
+            return
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            head = f.read(200000)
+        # A loaded CUDA backend lists its card ("- CUDA0 : NVIDIA ...") / "found 1 CUDA devices".
+        if re.search(r"\bCUDA\d+\b|found [1-9]\d* CUDA device", head):
+            return
+        log("[S32] WARNING: the model is running on the CPU, not the graphics card — "
+            "llama-server couldn't load its CUDA backend (llama_server.log lists only the CPU).")
+        state["startup_notification"] = (
+            "⚠ The model is running on the CPU, not your graphics card, so replies will be very "
+            "slow. llama-server's graphics-card files (cudart64_12.dll, cublas64_12.dll, "
+            "cublasLt64_12.dll) are missing from Sys 32's Home — restart System 32 and setup "
+            "downloads them (needs the internet once).")
+    except Exception:
+        pass
+
+
 def start_llama_server():
     """
     Start llama-server.exe with the configured model.
@@ -812,6 +990,7 @@ def start_llama_server():
     batch_size  = CONFIG.get("lmstudio_batch_size", 512)
     kv_cache    = CONFIG.get("lmstudio_kv_cache", "f16")     # f16 | q8_0 | q4_0
     flash_attn  = bool(CONFIG.get("lmstudio_flash_attn", False))
+    gpus        = None                                      # graphics cards (see _device_args)
 
     # Override with per-model settings if available
     if model_path:
@@ -830,8 +1009,13 @@ def start_llama_server():
                     batch_size = _s.get("batch_size", batch_size)
                     kv_cache   = _s.get("kv_cache",   kv_cache)
                     flash_attn = bool(_s.get("flash_attn", flash_attn))
+                    if isinstance(_s.get("gpus_on"), list):
+                        gpus = [str(n) for n in _s["gpus_on"]]
+                    elif _s.get("gpus") == "all":
+                        gpus = "all"
                     log(f"[S32] Applied model settings: ctx={ctx} gpu_layers={gpu_layers} "
-                        f"threads={threads} batch={batch_size} kv={kv_cache} fa={flash_attn}")
+                        f"threads={threads} batch={batch_size} kv={kv_cache} fa={flash_attn}"
+                        + (f" cards={len(gpus) if isinstance(gpus, list) else gpus}" if gpus else ""))
             except Exception:
                 pass
 
@@ -954,6 +1138,7 @@ def start_llama_server():
             ]
     if threads and int(threads) > 0:
         _args += ["--threads", str(int(threads))]
+    _args += _device_args(server, gpus)
     # KV-cache quantization — the biggest VRAM saver at long context. llama.cpp
     # requires flash attention for a quantized KV cache, so force it on when the
     # cache type isn't full-precision f16.
@@ -974,73 +1159,93 @@ def start_llama_server():
     # of falsely reporting a crash.
     my_gen = state.get("llama_gen", 0) + 1
     state["llama_gen"] = my_gen
-    _kill_llama_on_port(port)
-    time.sleep(1)                       # let the port + VRAM free before relaunch
-
-    from s32_config import CREATE_SUSPENDED, tie_to_s32
-    proc = subprocess.Popen(
-        _args,
-        creationflags=subprocess.CREATE_NO_WINDOW | (CREATE_SUSPENDED if os.name == "nt" else 0),
-        stdout=_lf,
-        stderr=_lf,
-    )
-    tie_to_s32(proc, "llama-server")      # ends with System 32, however it closes
-
-    def _log_tail(path, n=1400):
-        try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                return f.read()[-n:]
-        except Exception:
-            return ""
-
-    # Wait for server to become ready
-    for i in range(60):
-        time.sleep(3)
-        if state.get("llama_gen") != my_gen:            # a newer load took over
-            log("[S32] llama-server load superseded by a newer request — abandoning this wait.")
-            return
-        if proc.poll() is not None:                     # process exited = it crashed
-            tail = _log_tail(_llama_log)
-            log(f"[S32] ERROR: llama-server exited (code {proc.returncode}) before becoming ready.")
-            if tail:
-                log("[S32] llama-server.log (tail):\n" + tail)
-            state["model_switching"] = False
-            state["startup_notification"] = (
-                f"⚠ Model failed to load: {os.path.basename(model_path)}. "
-                f"llama-server exited on startup — usually the context length or KV-cache "
-                f"setting needs more VRAM than is free, or a launch flag isn't supported by "
-                f"this build. Click the SYSTEM 32 logo to lower CONTEXT or change KV CACHE. "
-                f"(Full error in llama_server.log.)"
-            )
-            state["lmstudio_ready"] = True              # let the UI come up so settings can be fixed
-            return
-        if is_up(f"{host}/v1/models"):
-            time.sleep(2)  # let the model finish loading weights before probing
-            _vs = _probe_vision(host)
-            state["vision_ready"] = (_vs == "vision")
-            _write_vision_marker(model_path, mmproj_path if _has_mmproj else "", _vs)
-            log(f"[S32] llama-server ready (vision {'on' if state['vision_ready'] else 'off'}).")
-            state["lmstudio_ready"] = True
-            state["model_switching"] = False
-            return
-        if i % 5 == 0:
-            log(f"[S32] Waiting for llama-server... ({i*3}s)")
-
-    # Timeout — shut down and report clearly (unless superseded)
-    if state.get("llama_gen") != my_gen:
-        return
-    log("[S32] ERROR: llama-server timed out. The model may require different settings.")
+    _lkey = _load_key(model_path, ctx, gpu_layers, kv_cache,
+                      mmproj_path if (mmproj_path and os.path.exists(mmproj_path)) else "") + \
+        ("|cards:" + "+".join(sorted(str(n).lower() for n in gpus)) if isinstance(gpus, list)
+         else "|all-gpus" if gpus == "all" else "")
+    _t0 = time.time()
+    state["load_model"] = {"gen": my_gen, "started": _t0, "expect": _expected_load(_lkey),
+                           "name": os.path.splitext(os.path.basename(model_path))[0]}
     try:
-        shutdown_llama_server()
-    except Exception:
-        pass
-    state["model_switching"] = False
-    state["startup_notification"] = (
-        f"⚠ Model failed to load: {os.path.basename(model_path)}. "
-        f"Click the SYSTEM 32 logo to select a different model or adjust settings."
-    )
-    # Allow UI to start so user can use the switcher
-    state["lmstudio_ready"] = True
+        _kill_llama_on_port(port)
+        time.sleep(1)                       # let the port + VRAM free before relaunch
+
+        from s32_config import CREATE_SUSPENDED, tie_to_s32
+        proc = subprocess.Popen(
+            _args,
+            creationflags=subprocess.CREATE_NO_WINDOW | (CREATE_SUSPENDED if os.name == "nt" else 0),
+            stdout=_lf,
+            stderr=_lf,
+        )
+        tie_to_s32(proc, "llama-server")      # ends with System 32, however it closes
+        _llama_proc["proc"] = proc            # for the loading bar's ✕
+
+        def _log_tail(path, n=1400):
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    return f.read()[-n:]
+            except Exception:
+                return ""
+
+        # Wait for server to become ready
+        for i in range(60):
+            time.sleep(3)
+            if state.get("llama_cancel") == my_gen:          # the ✕ on the loading bar
+                return
+            if state.get("llama_gen") != my_gen:            # a newer load took over
+                log("[S32] llama-server load superseded by a newer request — abandoning this wait.")
+                return
+            if proc.poll() is not None:                     # process exited = it crashed
+                tail = _log_tail(_llama_log)
+                log(f"[S32] ERROR: llama-server exited (code {proc.returncode}) before becoming ready.")
+                if tail:
+                    log("[S32] llama-server.log (tail):\n" + tail)
+                state["model_switching"] = False
+                state["startup_notification"] = (
+                    f"⚠ Model failed to load: {os.path.basename(model_path)}. "
+                    f"llama-server exited on startup — usually the context length or KV-cache "
+                    f"setting needs more VRAM than is free, or a launch flag isn't supported by "
+                    f"this build. Click the SYSTEM 32 logo to lower CONTEXT or change KV CACHE. "
+                    f"(Full error in llama_server.log.)"
+                )
+                state["lmstudio_ready"] = True              # let the UI come up so settings can be fixed
+                return
+            if is_up(f"{host}/v1/models"):
+                time.sleep(2)  # let the model finish loading weights before probing
+                _vs = _probe_vision(host)
+                state["vision_ready"] = (_vs == "vision")
+                _write_vision_marker(model_path, mmproj_path if _has_mmproj else "", _vs)
+                log(f"[S32] llama-server ready (vision {'on' if state['vision_ready'] else 'off'}).")
+                _remember_load(_lkey, time.time() - _t0)
+                state["load_key"] = _lkey          # the 'settling in' time is kept per load key
+                state["settle_first"] = True       # the next prompt rebuild is this load's first
+                _check_gpu_used(_llama_log, gpu_layers)
+                state["lmstudio_ready"] = True
+                state["model_switching"] = False
+                return
+            if i % 5 == 0:
+                log(f"[S32] Waiting for llama-server... ({i*3}s)")
+
+        # Timeout — shut down and report clearly (unless superseded)
+        if state.get("llama_gen") != my_gen:
+            return
+        log("[S32] ERROR: llama-server timed out. The model may require different settings.")
+        try:
+            shutdown_llama_server()
+        except Exception:
+            pass
+        state["model_switching"] = False
+        state["startup_notification"] = (
+            f"⚠ Model failed to load: {os.path.basename(model_path)}. "
+            f"Click the SYSTEM 32 logo to select a different model or adjust settings."
+        )
+        # Allow UI to start so user can use the switcher
+        state["lmstudio_ready"] = True
+    finally:
+        # The bar goes away however this ends (ready, crashed, timed out) — unless a
+        # newer load has already put up its own.
+        if (state.get("load_model") or {}).get("gen") == my_gen:
+            state["load_model"] = None
 
 
 def shutdown_llama_server():

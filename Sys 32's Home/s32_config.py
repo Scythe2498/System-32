@@ -812,6 +812,12 @@ def cancellable_post_stream(url, data, timeout=300, on_delta=None):
                     _finish[0] = evt["choices"][0]["finish_reason"]
             except Exception:
                 continue
+            _ft = state.pop("on_first_token", None)      # the model has started answering
+            if _ft:                                       # (the 'settling in' bar, s32_llm)
+                try:
+                    _ft()
+                except Exception:
+                    pass
             _rc = delta.get("reasoning_content") or delta.get("reasoning")
             if _rc:
                 reasoning_parts.append(_rc)

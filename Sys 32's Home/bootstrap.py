@@ -1323,6 +1323,146 @@ def _ensure_llama_server(script_dir):
         return None
 
 
+# The CUDA runtime llama-server's graphics-card backend needs (2026-11-02). llama.cpp ships it
+# as a SEPARATE zip next to the build: without these three DLLs ggml-cuda.dll can't load and
+# llama-server quietly runs the whole model on the CPU (found: a 27B model reading at 9 tokens/s
+# on a 5070 Ti; its log listed only the CPU). Same release, same CUDA 12.4 as LLAMA_ASSET.
+CUDART_ASSET = "cudart-llama-bin-win-cuda-12.4-x64.zip"
+CUDART_URL   = (f"https://github.com/ggml-org/llama.cpp/releases/download/"
+                f"{LLAMA_BUILD}/{CUDART_ASSET}")
+CUDART_DLLS  = ("cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll")
+
+
+def _ensure_cuda_runtime(script_dir):
+    """Put the CUDA runtime DLLs next to llama-server.exe when this computer has an NVIDIA
+    card. Checked every start (cheap); downloaded once (~390 MB zip, only the 3 DLLs are
+    kept). Never on a computer without an NVIDIA card — the drive fetches them the first
+    time it's plugged into one."""
+    import shutil
+    missing = [d for d in CUDART_DLLS if not os.path.exists(os.path.join(script_dir, d))]
+    if not missing:
+        ok("Graphics-card support for the model (CUDA runtime) present.")
+        return True
+    if not os.path.exists(os.path.join(script_dir, "ggml-cuda.dll")):
+        return False                      # not a CUDA build of llama-server — nothing to add
+    try:
+        cuda, _cap, name = _nvidia_info()
+    except Exception:
+        cuda, name = None, ""
+    if not name:
+        pr("No NVIDIA graphics card found — the model runs on the CPU on this computer.")
+        return False
+    if cuda and tuple(cuda) < (12, 4):
+        warn(f"{name}: the NVIDIA driver is too old for llama-server's CUDA 12.4 — update the "
+             f"driver (nvidia.com) or the model runs on the CPU.")
+        return False
+    if AIRPLANE:
+        warn("The model's graphics-card support isn't installed, and airplane mode is on — "
+             "the model runs on the CPU until it's off.")
+        return False
+    pr(f"Downloading graphics-card support for the model (CUDA runtime, one-time, ~390 MB) for {name}...")
+    zip_path = os.path.join(script_dir, "cudart_temp.zip")
+    try:
+        _download(CUDART_URL, zip_path)
+        import zipfile
+        got = []
+        with zipfile.ZipFile(zip_path) as z:
+            for n in z.namelist():
+                base = n.replace("\\", "/").split("/")[-1]
+                if base in CUDART_DLLS:
+                    part = os.path.join(script_dir, base + ".part")
+                    with z.open(n) as src, open(part, "wb") as out:
+                        shutil.copyfileobj(src, out)
+                    os.replace(part, os.path.join(script_dir, base))
+                    got.append(base)
+        still = [d for d in CUDART_DLLS if not os.path.exists(os.path.join(script_dir, d))]
+        if still:
+            warn(f"The CUDA runtime download was missing {', '.join(still)} — the model may run on the CPU.")
+            return False
+        ok(f"Graphics-card support for the model installed ({', '.join(got)}).")
+        return True
+    except Exception as e:
+        warn(f"Couldn't download the model's graphics-card support: {e}")
+        warn(f"Download manually: {CUDART_URL} — put its 3 .dll files next to llama-server.exe.")
+        return False
+    finally:
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
+
+
+# Vulkan add-on for llama-server (2026-11-02): a second graphics card that ISN'T NVIDIA (e.g. an
+# AMD RX 9060 XT next to a 5070 Ti, or an AMD-only computer) is reached through llama.cpp's
+# Vulkan backend. It's one file, ggml-vulkan.dll, from the SAME b9500 release (its core DLLs are
+# byte-identical to the CUDA build's). System 32 then names the cards it uses (s32_hardware).
+VULKAN_ASSET = f"llama-{LLAMA_BUILD}-bin-win-vulkan-x64.zip"
+VULKAN_URL   = (f"https://github.com/ggml-org/llama.cpp/releases/download/"
+                f"{LLAMA_BUILD}/{VULKAN_ASSET}")
+_BUILTIN_GPU = ("intel", "microsoft", "(tm) graphics", "basic display", "parsec", "virtual",
+                "remote")
+
+
+def _other_gpus():
+    """Graphics cards Windows lists that aren't NVIDIA and aren't built-in graphics."""
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-Command",
+                            "Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name }"],
+                           capture_output=True, text=True, timeout=30,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception:
+        return []
+    out = []
+    for name in (r.stdout or "").splitlines():
+        n = name.strip()
+        low = n.lower()
+        if not n or "nvidia" in low or any(b in low for b in _BUILTIN_GPU) or low == "amd radeon graphics":
+            continue
+        out.append(n)
+    return out
+
+
+def _ensure_vulkan_backend(script_dir):
+    """ggml-vulkan.dll next to llama-server.exe when this computer has a non-NVIDIA card.
+    Kept once it's there (the drive may meet such a computer again)."""
+    dest = os.path.join(script_dir, "ggml-vulkan.dll")
+    if os.path.exists(dest):
+        ok("Vulkan graphics support for the model present.")
+        return True
+    if not os.path.exists(os.path.join(script_dir, "llama-server.exe")):
+        return False
+    others = _other_gpus()
+    if not others:
+        return False                      # NVIDIA only (or built-in graphics) — nothing to add
+    if AIRPLANE:
+        warn(f"{others[0]} can't be used for the model yet — airplane mode is on.")
+        return False
+    pr(f"Downloading Vulkan graphics support for the model (one-time, ~34 MB) for {others[0]}...")
+    zip_path = os.path.join(script_dir, "vulkan_temp.zip")
+    try:
+        import zipfile, shutil
+        _download(VULKAN_URL, zip_path)
+        with zipfile.ZipFile(zip_path) as z:
+            src = [n for n in z.namelist() if n.replace("\\", "/").split("/")[-1] == "ggml-vulkan.dll"]
+            if not src:
+                warn("The Vulkan download didn't contain ggml-vulkan.dll.")
+                return False
+            with z.open(src[0]) as s, open(dest + ".part", "wb") as o:
+                shutil.copyfileobj(s, o)
+            os.replace(dest + ".part", dest)
+        ok(f"Vulkan graphics support installed — {others[0]} can now run the model "
+           f"(choose GRAPHICS CARDS in the model settings).")
+        return True
+    except Exception as e:
+        warn(f"Couldn't download Vulkan graphics support: {e}")
+        return False
+    finally:
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
+
+
 def _ssl_context():
     """HTTPS trust for downloads. The bundled/relocated Python's compiled-in default
     cert path doesn't resolve on a fresh host, so urlopen falls back to an EMPTY trust
@@ -2202,6 +2342,8 @@ def main():
     # Download llama-server.exe if not present
     script_dir = os.path.dirname(os.path.abspath(__file__))
     _ensure_llama_server(script_dir)
+    _ensure_cuda_runtime(script_dir)      # without it the model silently runs on the CPU
+    _ensure_vulkan_backend(script_dir)    # a non-NVIDIA card (AMD) for the model
 
     # ComfyUI (downloaded if missing), its venv, and the voice files
     _ensure_comfyui(script_dir)

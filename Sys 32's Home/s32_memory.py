@@ -557,11 +557,9 @@ def remember_operator(name):
     global _current_operator
     state["operator"] = name
     _current_operator = name
-    try:
-        from s32_llm import invalidate_prompt_cache
-        invalidate_prompt_cache()
-    except Exception:
-        pass
+    # No system-prompt rebuild for this (2026-11-02): any change to the prompt makes the model
+    # re-read ALL of it (minutes on a big model). The name is already in this conversation
+    # (the remember_operator call + its result); the next start's prompt carries it.
     log(f"[S32] Operator for {_machine_name}: {name}")
     return {"ok": True, "quiet": True, "operator": name, "machine": _machine_name}
 
