@@ -44,7 +44,7 @@ except ImportError:
 
 # System 32's version. Raise it with every release on GitHub (tag vX.Y.Z) — the update
 # check compares the newest release against this (s32_update.py).
-VERSION = "0.9.1"
+VERSION = "0.9.2"
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
