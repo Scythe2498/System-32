@@ -349,6 +349,13 @@ def wf_run_tool(name, overrides, target, img_bytes=None):
         outranking last_image_path — which can be stale or cleared by intervening state.
     """
     # Pick ComfyUI host - check live if state flag hasn't been set yet
+    if state.get("comfy_hold"):
+        _what = (state.get("installing") or {}).get("what") or state["comfy_hold"]
+        return {"group": "activity", "label": "workflow",
+                "content": f"ComfyUI is stopped for a moment while installing {_what} — run it again when the bar finishes.",
+                "error": (f"ComfyUI is stopped while System 32 installs {_what} for a workflow (the bar "
+                          f"below the chat shows it). Nothing was run. Tell the operator to wait for the "
+                          f"'✓ Installed' note and then ask again — don't retry on your own.")}
     img_up = state["comfy_image_ready"] or is_up(CONFIG["comfy_image_host"])
     log(f"[S32][WF] target={target} | image_ready={state['comfy_image_ready']} img_up={img_up}")
 
@@ -895,6 +902,27 @@ def wf_run_tool(name, overrides, target, img_bytes=None):
                                                                   "Nothing was saved.")}
                 except Exception as e:
                     log(f"[S32][WF] missing-model handoff failed: {e}")
+            # A node that needs a Python package it doesn't have (it imports it only when it
+            # runs) → install it into ComfyUI's Python and restart ComfyUI (2026-11-05).
+            _mod = __import__("re").search(r"No module named '([^']+)'", _why)
+            if _mod:
+                try:
+                    from s32_hardware import install_python_module
+                    _ip = install_python_module(_mod.group(1))
+                except Exception as e:
+                    _ip = {"error": str(e)[:150]}
+                if _ip.get("started"):
+                    _what = (f"it needs the Python package {_ip['started']} — installing it now, then "
+                             f"ComfyUI restarts (the bar below shows it)")
+                    return {"group": "activity", "label": "workflow",
+                            "content": f"{os.path.splitext(name)[0]} stopped — {_what}. Run it again when this finishes.",
+                            "error": (f"The workflow stopped inside ComfyUI: {_why} System 32 is installing "
+                                      f"the package {_ip['started']} into ComfyUI and restarting it — nothing "
+                                      f"was saved. Tell the operator it's being installed and to ask again "
+                                      f"once it says it's done. Don't run it again yourself until then.")}
+                return {"error": f"The workflow failed inside ComfyUI — {_why} The package couldn't be "
+                                 f"installed automatically ({_ip.get('error')}). Nothing was saved. "
+                                 f"Tell the operator plainly what failed."}
             return {"error": f"The workflow failed inside ComfyUI — {_why} Nothing was saved. "
                              f"Tell the operator plainly what failed."}
         return {"error": "Workflow completed but produced no image or video output."}
@@ -996,6 +1024,10 @@ def start_comfy_image():
     """Launch ComfyUI (blocks until ready). Only one launch at a time — the revive
     monitor, node installer and restart_comfyui can all call this; a second caller
     while a launch is in progress just returns instead of starting a duplicate."""
+    if state.get("comfy_hold"):
+        # Stopped on purpose (an install is replacing its files) — the installer starts it.
+        log(f"[S32] ComfyUI stays stopped for now — installing {state['comfy_hold']}")
+        return
     if not _comfy_start_lock.acquire(blocking=False):
         log("[S32] ComfyUI launch already in progress — not starting a second one.")
         return
@@ -1283,6 +1315,44 @@ def _kill_comfy_port(port):
     except Exception as e:
         log(f"[S32] Could not stop ComfyUI: {e}")
         return False
+
+
+def comfy_stopped(reason=""):
+    """Context manager (2026-11-05): ComfyUI STOPPED while the body runs, started again after.
+    On Windows a running ComfyUI keeps its packages' files locked (cv2.pyd …), so pip can't
+    replace them ('[WinError 5] Access is denied') and every node / package install that
+    touches them failed. While stopped, `comfy_hold` makes start_comfy_image refuse, so the
+    revive / health monitors can't bring it back mid-install. Waits for a running generation
+    first. ComfyUI is started again however the body ends."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def _cm():
+        for _ in range(900):                       # up to ~30 min for a running job
+            if not state["gen_lock"].locked():
+                break
+            time.sleep(2)
+        state["comfy_hold"] = reason or "an update"          # WHAT is being installed
+        state["comfy_image_ready"] = False
+        port = int(str(CONFIG.get("comfy_image_host", "http://127.0.0.1:8188")).rsplit(":", 1)[-1])
+        log(f"[S32] Stopping ComfyUI while installing {state['comfy_hold']} (its files are locked while it runs)")
+        if _kill_comfy_port(port):
+            time.sleep(4)                           # let Windows release the file locks
+        try:
+            yield
+        finally:
+            state["comfy_hold"] = None
+            try:
+                start_comfy_image()
+            finally:
+                try:
+                    import s32_models
+                    s32_models.clear_cache()
+                except Exception:
+                    pass
+                if state.get("comfy_image_ready"):
+                    state["comfy_last_restart"] = time.time()
+    return _cm()
 
 
 def restart_comfyui(reason="", wait=True):
@@ -1783,6 +1853,31 @@ def _default_checkpoint(preferred=None):
     except Exception:
         return preferred or ""
 
+def _preflight_block(host, wf, what):
+    """generate_image / generate_video build their workflow in code and queued it blind —
+    a missing node came back as a bare 'Queue failed: HTTP Error 400' (2026-11-05). Same
+    pre-check as run_workflow: missing nodes / models are installed or downloaded, and the
+    operator gets the same card. None = go ahead."""
+    if state.get("comfy_hold"):
+        _what = (state.get("installing") or {}).get("what") or state["comfy_hold"]
+        return {"group": "activity", "label": "workflow",
+                "content": f"ComfyUI is stopped for a moment while installing {_what} — ask again when the bar finishes.",
+                "error": (f"ComfyUI is stopped while System 32 installs {_what}. Nothing was run. Tell "
+                          f"the operator to wait for the '✓ Installed' note and ask again.")}
+    try:
+        import s32_models
+        _pf = s32_models.preflight(host, wf)
+    except Exception as e:
+        log(f"[S32][WF] preflight skipped: {e}")
+        return None
+    if _pf and _pf.get("block"):
+        return {"error": _pf["message"], "group": "activity", "label": "workflow",
+                "missing_nodes": _pf.get("nodes", []),
+                "content": f"{what} can't run yet: {_pf.get('operator') or 'files are missing'}. "
+                           f"Run it again when this finishes."}
+    return None
+
+
 def run_image(params, img_bytes=None):
     host = CONFIG["comfy_image_host"]
     if not state["comfy_image_ready"]:
@@ -1810,6 +1905,9 @@ def run_image(params, img_bytes=None):
     else:
         wf.pop("37", None)
 
+    _blk = _preflight_block(host, wf, "The image generator")
+    if _blk:
+        return _blk
     try:
         prompt_id, _ = comfy_queue(host, wf)
     except Exception as e:
@@ -1922,6 +2020,9 @@ def run_video(params, img_bytes=None):
         except Exception:
             pass
 
+    _blk = _preflight_block(host, wf, "The video generator")
+    if _blk:
+        return _blk
     try:
         prompt_id, _ = comfy_queue(host, wf)
     except Exception as e:

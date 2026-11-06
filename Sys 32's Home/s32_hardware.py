@@ -176,6 +176,182 @@ def _registry_lookup(missing_names):
 
     return results
 
+# ── Node name → package (2026-11-05) ─────────────────────────────────────────
+# A workflow names NODES ("easy positive"); the registry above lists PACKAGES by title
+# ("ComfyUI Easy Use"), so matching names against titles found nothing. ComfyUI-Manager
+# also publishes extension-node-map.json: every package's URL → the exact node names it
+# provides. That's what ComfyUI-Manager itself uses to install missing nodes.
+_NODE_MAP_URL = "https://raw.githubusercontent.com/ltdrdata/ComfyUI-Manager/main/extension-node-map.json"
+_STATS_URL    = "https://raw.githubusercontent.com/ltdrdata/ComfyUI-Manager/main/github-stats.json"
+_CORE_URL     = "https://github.com/comfyanonymous/ComfyUI"
+_node_map_cache = None
+_stars_cache = None
+
+
+def _load_stars():
+    """{package URL: GitHub stars} from ComfyUI-Manager's stats — {} if it can't be had."""
+    global _stars_cache
+    if _stars_cache is not None:
+        return _stars_cache
+    try:
+        req = urllib.request.Request(_STATS_URL, headers={"User-Agent": "System32/1.0"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.loads(r.read().decode())
+        _stars_cache = {u.rstrip("/").lower(): int((v or {}).get("stars") or 0) for u, v in data.items()}
+    except Exception as e:
+        log(f"[S32] Could not load package star counts ({e}) — choosing without them")
+        _stars_cache = {}
+    return _stars_cache
+
+
+def _load_node_map():
+    """{node name: [package URLs]} + [(regex, URL)] — fetched once per session."""
+    global _node_map_cache
+    if _node_map_cache is not None:
+        return _node_map_cache
+    try:
+        import s32_config as _cfg
+        if _cfg.airplane():
+            return {}, []
+        req = urllib.request.Request(_NODE_MAP_URL, headers={"User-Agent": "System32/1.0"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.loads(r.read().decode())
+        names, patterns, sets = {}, [], {}
+        for url, v in data.items():
+            if not (isinstance(v, list) and v):
+                continue
+            sets[url] = {str(n) for n in (v[0] or [])}
+            for n in (v[0] or []):
+                names.setdefault(str(n), []).append(url)
+            meta = v[1] if len(v) > 1 and isinstance(v[1], dict) else {}
+            if meta.get("nodename_pattern"):
+                try:
+                    patterns.append((re.compile(meta["nodename_pattern"]), url))
+                except re.error:
+                    pass
+        _node_map_cache = (names, patterns, sets)
+        log(f"[S32] Node name map loaded: {len(names)} node names in {len(data)} packages")
+        return _node_map_cache
+    except Exception as e:
+        log(f"[S32] Could not load the node name map: {e}")
+        return {}, [], {}
+
+
+def _node_map_lookup(missing_names):
+    """Exact node names → [{name, title, url}] (one entry per package). Several packages
+    can claim the same name — bundles and copies include another pack's nodes wholesale
+    (VideoHelperSuite's nodes are also inside a 603-node bundle; ComfyUI_essentials'
+    'MaskBlur+' inside a 4-star toolkit). The ORIGINAL is chosen by GitHub stars
+    (ComfyUI-Manager's own stats: VideoHelperSuite 1908 vs the bundle's 120), then the
+    curated list, then the pack covering more of this workflow's missing nodes.
+    A node ComfyUI ITSELF provides is never installed from a copy: it's missing because
+    this ComfyUI is older than the workflow → {"core": True} so the caller says so."""
+    names, patterns, sets = _load_node_map()
+    if not names and not patterns:
+        return []
+    curated = {}
+    for e in _load_registry() or []:
+        u = (e.get("reference") or "").rstrip("/").lower()
+        if u:
+            curated[u] = e.get("title") or u.split("/")[-1]
+    out, seen = [], {}
+    for name in missing_names:
+        urls = list(names.get(name, []))
+        if not urls:
+            urls = [u for rx, u in patterns if rx.search(name)]
+        if any(u.rstrip("/").lower() == _CORE_URL.lower() for u in urls):
+            out.append({"name": name, "core": True, "names": [name], "url": "", "title": "ComfyUI"})
+            continue
+        urls = [u for u in urls if u.lower().startswith("https://github.com/")]
+        if not urls:
+            continue
+        if len(urls) > 1:
+            stars = _load_stars()
+            def _rank(u):
+                mine = sets.get(u, set()) or {name}
+                return (-stars.get(u.rstrip("/").lower(), 0), u.rstrip("/").lower() not in curated,
+                        -len(mine & set(missing_names)), len(mine))
+            urls.sort(key=_rank)
+        url = urls[0]
+        if url in seen:
+            continue
+        seen[url] = True
+        out.append({"name": name, "url": url,
+                    "title": curated.get(url.rstrip("/").lower(), url.rstrip("/").split("/")[-1]),
+                    "names": [n for n in missing_names if n in sets.get(url, ())] or [name]})
+    return out
+
+
+def _torch_guard_env(python_exe, custom_nodes_dir):
+    """A node pack's requirements (or its install.py) must never swap ComfyUI's PyTorch —
+    a plain 'torch' from PyPI is the CPU build and the graphics card stops being used
+    (2026-11-05). pip honours PIP_CONSTRAINT for every install it runs, so the torch set
+    that's installed now is pinned for the whole node install. A pack that truly needs
+    another torch then fails its pip step (reported) instead of breaking ComfyUI."""
+    env = os.environ.copy()
+    try:
+        r = subprocess.run(
+            [python_exe, "-c",
+             "import importlib.metadata as m\n"
+             "for p in ('torch','torchvision','torchaudio'):\n"
+             "    try: print(p + '==' + m.version(p))\n"
+             "    except Exception: pass"],
+            capture_output=True, text=True, timeout=60,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        pins = [l.strip() for l in (r.stdout or "").splitlines() if "==" in l]
+        if pins:
+            cfile = os.path.join(os.path.dirname(os.path.abspath(custom_nodes_dir)), ".s32_torch_pins.txt")
+            with open(cfile, "w", encoding="utf-8") as f:
+                f.write("\n".join(pins) + "\n")
+            # As a file:// URL: pip splits PIP_CONSTRAINT on spaces, so a plain path like
+            # "I:\Sys 32's Home\..." became "I:\Sys" → 'Could not open requirements file'
+            # and the pack's dependencies were never installed (2026-11-05). The URL has none.
+            import pathlib
+            env["PIP_CONSTRAINT"] = pathlib.Path(cfile).resolve().as_uri()
+            log(f"[S32] Node install: PyTorch kept as is ({', '.join(pins)})")
+    except Exception as e:
+        log(f"[S32] Node install: couldn't read the PyTorch version ({e}) — installing without the pin")
+    return env
+
+
+# A node that imports a Python package only when it RUNS (Easy-Use's background remover →
+# transparent_background) fails mid-workflow with "No module named 'x'" (2026-11-05).
+# The import name usually is the pip name; these are the common exceptions.
+_MODULE_PIP = {
+    "cv2": "opencv-python", "PIL": "pillow", "skimage": "scikit-image", "sklearn": "scikit-learn",
+    "yaml": "pyyaml", "bs4": "beautifulsoup4", "Crypto": "pycryptodome", "dateutil": "python-dateutil",
+    "fitz": "pymupdf", "attr": "attrs", "git": "GitPython", "google": "protobuf",
+    "segment_anything": "segment-anything", "mmcv": "mmcv", "lap": "lap", "sam2": "sam2",
+    "pkg_resources": "setuptools", "OpenGL": "PyOpenGL", "win32api": "pywin32", "win32con": "pywin32",
+    "dotenv": "python-dotenv", "magic": "python-magic", "jwt": "PyJWT", "serial": "pyserial",
+    "zmq": "pyzmq", "usb": "pyusb", "docx": "python-docx", "pptx": "python-pptx",
+}
+_NEVER_PIP = {"torch", "torchvision", "torchaudio", "comfy", "folder_paths", "nodes", "server",
+              "execution", "comfy_extras", "custom_nodes", "xformers"}
+
+
+def install_python_module(module):
+    """A node couldn't import a Python package while running → install it in the background
+    (tool_install_missing_nodes' worker: ComfyUI stopped meanwhile, then restarted).
+    Returns {"started": pip_name} | {"error": ...}."""
+    import s32_config as _cfg
+    top = str(module or "").split(".")[0].strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,60}", top):
+        return {"error": f"'{module}' doesn't look like a Python package name"}
+    if top in _NEVER_PIP:
+        return {"error": f"'{top}' is part of ComfyUI / PyTorch itself — it can't be pip-installed "
+                         f"on its own"}
+    if _cfg.airplane():
+        return {"error": "airplane mode is on, so it can't be downloaded"}
+    pkg = _MODULE_PIP.get(top, top.replace("_", "-"))
+    if state.get("node_install_worker"):
+        return {"started": pkg, "busy": True}
+    r = tool_install_missing_nodes("image", modules=[top])
+    if r.get("status") == "installing":
+        return {"started": pkg}
+    return {"error": r.get("report") or r.get("message") or "nothing to install"}
+
+
 def _install_node(url, custom_nodes_dir, python_exe):
     """
     Clone a node repo into custom_nodes_dir and install its dependencies.
@@ -194,33 +370,26 @@ def _install_node(url, custom_nodes_dir, python_exe):
             log(f"[S32] {folder_name} exists but appears empty/broken - re-cloning")
             import shutil
             shutil.rmtree(dest, ignore_errors=True)
-        else:
-            # Already installed and looks valid - update it
-            try:
-                r = subprocess.run(
-                    ["git", "pull"], capture_output=True, text=True,
-                    timeout=60, cwd=dest
-                )
-                if r.returncode == 0:
-                    return True, f"Updated: {folder_name}"
-            except Exception:
-                pass
-            return True, f"Already installed: {folder_name}"
-
-    # git clone
-    try:
-        result = subprocess.run(
-            ["git", "clone", "--depth", "1", url, dest],
-            capture_output=True, text=True, timeout=120
-        )
-        if result.returncode != 0:
-            return False, f"git clone failed: {result.stderr[:300]}"
-    except FileNotFoundError:
-        return False, "git not found - install Git from https://git-scm.com/download/win"
-    except subprocess.TimeoutExpired:
-        return False, "git clone timed out"
-
-    msgs = [f"Cloned: {folder_name}"]
+    if os.path.exists(dest):
+        # Already there: NOT updated (a newer pack can need a newer ComfyUI than the pinned
+        # one), but its dependencies ARE checked — a pack whose pip step failed before
+        # stayed broken forever because this path returned early (2026-11-05).
+        msgs = [f"Already installed: {folder_name}"]
+    else:
+        # git clone
+        try:
+            result = subprocess.run(
+                ["git", "clone", "--depth", "1", url, dest],
+                capture_output=True, text=True, timeout=120
+            )
+            if result.returncode != 0:
+                return False, f"git clone failed: {result.stderr[:300]}"
+        except FileNotFoundError:
+            return False, "git not found - install Git from https://git-scm.com/download/win"
+        except subprocess.TimeoutExpired:
+            return False, "git clone timed out"
+        msgs = [f"Cloned: {folder_name}"]
+    _penv = _torch_guard_env(python_exe, custom_nodes_dir)
 
     # pip install requirements.txt if present
     req_file = os.path.join(dest, "requirements.txt")
@@ -229,12 +398,14 @@ def _install_node(url, custom_nodes_dir, python_exe):
             r2 = subprocess.run(
                 [python_exe, "-m", "pip", "install", "-r", req_file,
                  "--quiet", "--break-system-packages"],
-                capture_output=True, text=True, timeout=300
+                capture_output=True, text=True, timeout=300, env=_penv
             )
             if r2.returncode == 0:
                 msgs.append("Dependencies installed.")
             else:
-                msgs.append(f"pip warnings: {r2.stderr[:300]}")
+                _err = "\n".join(l for l in (r2.stderr or "").splitlines()
+                                 if l.strip() and not l.startswith("[notice]"))
+                msgs.append(f"pip warnings: {_err[:300]}")
         except subprocess.TimeoutExpired:
             msgs.append("pip install timed out.")
 
@@ -244,7 +415,7 @@ def _install_node(url, custom_nodes_dir, python_exe):
         try:
             r3 = subprocess.run(
                 [python_exe, install_script],
-                capture_output=True, text=True, timeout=120, cwd=dest
+                capture_output=True, text=True, timeout=120, cwd=dest, env=_penv
             )
             if r3.returncode == 0:
                 msgs.append("install.py ran successfully.")
@@ -356,200 +527,191 @@ def check_missing_nodes():
 
     threading.Thread(target=_inject_and_respond, daemon=True).start()
 
-def tool_install_missing_nodes(target=None):
+_MODULE_ERR_RE = re.compile(r"(?:No module named|ModuleNotFoundError[^']*)\s*'([A-Za-z_][A-Za-z0-9_.]*)'")
+
+
+def _scan_log_for_modules(log_path):
+    """Python packages ComfyUI's latest run couldn't import ('No module named x') — these
+    go to pip, never to a node pack with a similar title (2026-11-05: 'transparent_background'
+    pulled in an unrelated 'Transparent-background-comfyUI' pack)."""
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+            text = f.read()
+    except Exception:
+        return []
+    cut = max((text.rfind(mk) for mk in ("Total VRAM", "ComfyUI startup time", "Set vram state",
+                                          "Starting server", "** Platform:")), default=-1)
+    text = text[cut:] if cut >= 0 else "\n".join(text.splitlines()[-400:])
+    return sorted({m.group(1).split(".")[0] for m in _MODULE_ERR_RE.finditer(text)
+                   if m.group(1).split(".")[0] not in _NEVER_PIP})
+
+
+def _pip_into_comfy(pkgs, python_exe, cn):
+    """pip-install packages into ComfyUI's venv, PyTorch pinned. → (ok_list, fail_list)."""
+    done, failed = [], []
+    for pkg in pkgs:
+        state["installing"] = {"what": f"the Python package {pkg}", "started": time.time()}
+        log(f"[S32][MODELS] installing the Python package {pkg} into ComfyUI's Python")
+        try:
+            r = subprocess.run([python_exe, "-m", "pip", "install", pkg, "--quiet"],
+                               capture_output=True, text=True, timeout=900,
+                               env=_torch_guard_env(python_exe, cn),
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if r.returncode == 0:
+                done.append(pkg)
+                log(f"[S32][MODELS] ✓ installed {pkg}")
+            else:
+                err = "\n".join(l for l in (r.stderr or "").splitlines()
+                                if l.strip() and not l.startswith("[notice]"))[-300:]
+                failed.append(f"{pkg}: {err[:200]}")
+                log(f"[S32][MODELS] pip install {pkg} failed: {err}")
+        except Exception as e:
+            failed.append(f"{pkg}: {e}")
+    return done, failed
+
+
+def tool_install_missing_nodes(target=None, modules=None):
     """
-    Auto-install missing nodes for one or both ComfyUI instances.
-    target: 'image', 'video', or None (both)
+    Install what a workflow is missing: node packs (by exact node name) and Python packages
+    a node couldn't import. Planned here; the work runs in the background (2026-11-05):
+    ComfyUI is STOPPED while installing (on Windows it locks its packages' files — pip got
+    '[WinError 5] Access is denied: …cv2.pyd'), started again, and the new nodes checked.
+    The input-area bar shows each step. target: 'image' or None.
     """
     import s32_config as _cfg
     if _cfg.airplane():
         return {"status": "airplane", "message": _cfg.AIRPLANE_MSG,
                 "report": "Airplane mode is on — custom nodes can't be downloaded or installed."}
-    missing = state.get("missing_nodes", {})
-    if not missing:
-        image_log = os.path.join(CONFIG["comfy_image_dir"], "system32_image.log")
-        for label, log_path in [("image (8188)", image_log)]:
-            m = _scan_log_for_missing(log_path)
-            if m:
-                missing[label] = m
-        if not missing:
-            return {"status": "clean", "message": "No missing nodes found. Full toolkit available."}
+    if state.get("node_install_worker"):
+        return {"status": "busy", "report": "Already installing — the bar below the chat shows it."}
+    image_log = os.path.join(CONFIG["comfy_image_dir"], "system32_image.log")
+    if modules:                                    # just these Python packages
+        missing, modules = {}, {m for m in modules if m not in _NEVER_PIP}
+    else:
+        missing = {k: list(v) for k, v in (state.get("missing_nodes") or {}).items()}
+        modules = set()
+    if not missing and not modules:
+        modules = set(_scan_log_for_modules(image_log))
+        m = [n for n in _scan_log_for_missing(image_log) if n.split(".")[0] not in modules]
+        if m:
+            missing["image (8188)"] = m
+    if not missing and not modules:
+        return {"status": "clean", "message": "No missing nodes found. Full toolkit available."}
 
-    # Custom node dependencies must go into the Documents venv -
-    # that's what ComfyUI uses to load custom node Python code
-    user = os.environ.get("USERNAME", "")
-    docs_venv = os.path.join(
-        os.environ.get("USERPROFILE", f"C:\\Users\\{user}"),
-        "Documents", "ComfyUI", ".venv", "Scripts", "python.exe"
-    )
-    if not os.path.exists(docs_venv):
-        docs_venv = _find_comfyui_python(CONFIG["comfy_image_dir"])
+    docs_venv = _find_comfyui_python(CONFIG["comfy_image_dir"])
+    cn = os.path.join(CONFIG["comfy_image_dir"], "custom_nodes")
     log(f"[S32] Node install using Python: {docs_venv}")
 
-    instance_map = {
-        "image (8188)": {
-            "custom_nodes": os.path.join(CONFIG["comfy_image_dir"], "custom_nodes"),
-            "python": docs_venv
-        }
-    }
-
-    report = []
-    installed_any = False
-    already_done = set()
-    installed_titles = []  # track all installed node titles for verification
-
+    report, plan_nodes, plan_pip = [], [], []
+    seen = set()
     for label, names in missing.items():
         if target and target not in label:
             continue
-        info = instance_map.get(label)
-        if not info:
-            continue
-
-        for name in names:
-            # Check pip-installable nodes first
-            top = name.split(".")[0].lower().replace("-","").replace("_","")
-            pip_pkg = None
+        for name in names:                         # the few pip-only 'nodes'
+            top = name.split(".")[0].lower().replace("-", "").replace("_", "")
             for key, pkg in _PIP_NODES.items():
-                if top in key.lower().replace("-","").replace("_",""):
-                    pip_pkg = pkg
+                if top in key.lower().replace("-", "").replace("_", "") and pkg not in seen:
+                    seen.add(pkg); plan_pip.append(pkg)
                     break
+        matches = _node_map_lookup(names)
+        core = [m["name"] for m in matches if m.get("core")]
+        matches = [m for m in matches if not m.get("core")]
+        for n in core:
+            report.append(f"? [{label}] '{n}' is one of ComfyUI's own nodes, and this ComfyUI "
+                          f"version doesn't have it — the workflow was made with a newer ComfyUI.")
+        covered = {n for m in matches for n in m.get("names", [m["name"]])} | set(core)
+        rest = [n for n in names if n not in covered]
+        if rest:                                   # old title matching: only for node-like names
+            matches += [m for m in _registry_lookup(rest)
+                        if m["url"] not in {x["url"] for x in matches}]
+            covered |= {m["name"] for m in matches}
+        for m in matches:
+            if m["url"] not in seen:
+                seen.add(m["url"]); plan_nodes.append(m)
+        for name in names:
+            if name not in covered:
+                report.append(f"? [{label}] '{name}' - no package found that provides this node. "
+                              f"Search its name on github.com, or install it with ComfyUI Manager.")
+    for mod in sorted(modules):
+        pkg = _MODULE_PIP.get(mod, mod.replace("_", "-"))
+        if pkg not in seen:
+            seen.add(pkg); plan_pip.append(pkg)
 
-            if pip_pkg and pip_pkg not in already_done:
-                already_done.add(pip_pkg)
-                log(f"[S32] pip installing {pip_pkg} for {label}...")
-                ok_r, msg = _pip_install_node(pip_pkg, info["python"])
-                status = "✓" if ok_r else "✗"
-                report.append(f"{status} [{label}] {pip_pkg} (pip)\n   {msg}")
-                if ok_r:
-                    installed_any = True
-                    installed_titles.append(pip_pkg)
-                continue
+    if not plan_nodes and not plan_pip:
+        state["installing"] = None
+        if report:
+            state["startup_notification"] = "⚠ Couldn't install the workflow's missing nodes:\n" + \
+                "\n".join(r.split("] ", 1)[-1] for r in report if r.startswith("?"))
+        else:
+            report.append("Nothing new to install.")
+        return {"status": "done", "report": "\n".join(report)}
 
-        # Registry lookup for git-cloned nodes
-        matches = _registry_lookup(names)
-        matched_names = {m["name"] for m in matches}
-        unmatched = [n for n in names if n not in matched_names]
+    what = ", ".join([m["title"] for m in plan_nodes] + plan_pip)
 
-        for match in matches:
-            if match["url"] in already_done:
-                continue
-            already_done.add(match["url"])
-            log(f"[S32] Installing {match['title']} into {label}...")
-            ok_r, msg = _install_node(match["url"], info["custom_nodes"], info["python"])
-            status = "✓" if ok_r else "✗"
-            report.append(f"{status} [{label}] {match['title']}\n   {msg}")
-            if ok_r:
-                installed_any = True
-                installed_titles.append(match["title"])
+    def _work():
+        from s32_comfyui import comfy_stopped
+        state["node_install_worker"] = True
+        installed, failed_msgs = [], []
+        try:
+            with comfy_stopped(what):
+                for m in plan_nodes:
+                    _for = ", ".join(m.get("names") or [m["name"]])
+                    log(f"[S32] Installing {m['title']} (for: {_for})...")
+                    state["installing"] = {"what": f"{m['title']} (nodes)", "started": time.time()}
+                    ok_r, msg = _install_node(m["url"], cn, docs_venv)
+                    log(f"[S32][MODELS] {'✓' if ok_r else '✗'} {m['title']}: {msg[:300]}")
+                    if ok_r and "pip warnings" not in msg:
+                        installed.append(m["title"])
+                    elif ok_r:
+                        installed.append(m["title"])
+                        failed_msgs.append(f"{m['title']} — some of its dependencies didn't install: "
+                                           f"{msg.split('pip warnings:', 1)[-1].strip()[:180]}")
+                    else:
+                        failed_msgs.append(f"{m['title']} — {msg[:180]}")
+                ok_p, bad_p = _pip_into_comfy(plan_pip, docs_venv, cn)
+                installed += ok_p
+                failed_msgs += bad_p
+                state["installing"] = {"what": "ComfyUI (loading what was installed)",
+                                       "started": time.time(), "restart": True}
+            # ComfyUI is started again by comfy_stopped. Check the node packs loaded.
+            verified, broken = [], []
+            try:
+                content = open(image_log, "r", encoding="utf-8", errors="ignore").read()
+                cut = max((content.rfind(mk) for mk in ("Total VRAM", "Starting server", "** Platform:")), default=-1)
+                content = content[cut:] if cut >= 0 else content
+            except Exception:
+                content = ""
+            for title in [m["title"] for m in plan_nodes if m["title"] in installed]:
+                key = title.lower().replace(" ", "").replace("-", "").replace("_", "")
+                bad = any("import failed" in ln.lower() and key in ln.lower().replace(" ", "").replace("-", "").replace("_", "")
+                          for ln in content.splitlines())
+                (broken if bad else verified).append(title)
+            verified += [p for p in plan_pip if p in installed]
+            state["missing_nodes"] = {}
+            if verified and not broken and not failed_msgs:
+                log(f"[S32] ✓ Verified loaded: {', '.join(verified)}")
+                state["startup_notification"] = (f"✓ Installed {', '.join(verified)} and restarted ComfyUI "
+                                                 f"— the workflow can run now. Ask again to run it.")
+            else:
+                lines = []
+                if verified:
+                    lines.append(f"✓ Installed {', '.join(verified)}.")
+                if broken:
+                    log(f"[S32] ✗ Still failing after install: {', '.join(broken)}")
+                    lines.append(f"✗ {', '.join(broken)} didn't load (see system32_image.log).")
+                lines += [f"✗ {f}" for f in failed_msgs]
+                state["startup_notification"] = "\n".join(lines) + "\nComfyUI has restarted."
+        except Exception as e:
+            log(f"[S32] Node install failed: {e}")
+            state["startup_notification"] = f"⚠ Installing {what} failed: {e}"
+        finally:
+            state["installing"] = None
+            state["node_install_worker"] = False
 
-        for name in unmatched:
-            report.append(f"? [{label}] '{name}' - not in registry. Try ComfyUI Manager manually.")
-
-    if installed_any:
-        report.append("\n✓ Nodes installed. Restarting ComfyUI to load them...")
-        state["missing_nodes"] = {}
-
-        # Autonomously restart ComfyUI and verify nodes loaded
-        def _restart_and_verify():
-            import socket
-            from s32_comfyui import start_comfy_image
-            time.sleep(2)
-
-            for port, start_fn, ready_key, log_name in [
-                (8188, start_comfy_image, "comfy_image_ready", "system32_image.log"),
-
-            ]:
-                try:
-                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                        s.settimeout(1)
-                        if s.connect_ex(("127.0.0.1", port)) != 0:
-                            continue
-                    # Kill by PID
-                    r = subprocess.run(
-                        ["netstat", "-ano"],
-                        capture_output=True, text=True, timeout=10
-                    )
-                    for line in r.stdout.splitlines():
-                        if f":{port}" in line and "LISTENING" in line:
-                            pid = line.strip().split()[-1]
-                            try:
-                                subprocess.run(
-                                    ["taskkill", "/F", "/PID", pid],
-                                    capture_output=True, timeout=10
-                                )
-                                log(f"[S32] Killed ComfyUI on port {port} (PID {pid})")
-                            except Exception:
-                                pass
-                            break
-                    time.sleep(3)
-                    state[ready_key] = False
-                    threading.Thread(target=start_fn, daemon=True).start()
-                    log(f"[S32] Relaunching ComfyUI on port {port}...")
-
-                    # Wait for ComfyUI to come back up
-                    host = f"http://127.0.0.1:{port}"
-                    for _ in range(60):
-                        time.sleep(3)
-                        if is_up(host):
-                            break
-
-                    # Read log and verify nodes loaded
-                    log_path = os.path.join(CONFIG["comfy_image_dir"], log_name)
-                    time.sleep(5)  # give it a moment to finish writing
-                    verified = []
-                    failed = []
-                    if os.path.exists(log_path):
-                        try:
-                            content = open(log_path, "r", encoding="utf-8", errors="ignore").read()
-                            for title in installed_titles:
-                                title_lower = title.lower().replace(" ", "").replace("-", "")
-                                if "import failed" in content.lower():
-                                    # Check if this specific node failed
-                                    for line in content.splitlines():
-                                        if "IMPORT FAILED" in line:
-                                            line_clean = line.lower().replace(" ", "").replace("-", "")
-                                            if title_lower in line_clean:
-                                                failed.append(title)
-                                                break
-                                    else:
-                                        verified.append(title)
-                                else:
-                                    verified.append(title)
-                        except Exception:
-                            pass
-
-                    if verified:
-                        log(f"[S32] ✓ Verified loaded: {', '.join(verified)}")
-                        state["startup_notification"] = f"✓ Nodes installed and verified: {', '.join(verified)}"
-                        state["install_failures"] = {}  # reset on success
-                    if failed:
-                        log(f"[S32] ✗ Still failing after install: {', '.join(failed)}")
-                        # Track failures - stop retrying after 2 attempts per session
-                        for f in failed:
-                            state.setdefault("install_failures", {})[f] = \
-                                state.get("install_failures", {}).get(f, 0) + 1
-                        persistent = [f for f in failed
-                                      if state.get("install_failures", {}).get(f, 0) >= 2]
-                        if persistent:
-                            log(f"[S32] Giving up on persistent failures: {persistent} - manual install required")
-                            state["startup_notification"] = (state.get("startup_notification") or "") + \
-                                f"\n✗ Persistent failures (giving up): {', '.join(persistent)} - manual pip install required"
-                        else:
-                            state["startup_notification"] = (state.get("startup_notification") or "") + \
-                                f"\n✗ Still failing: {', '.join(failed)} - dependencies may need manual install"
-
-                except Exception as e:
-                    log(f"[S32] Restart/verify error on port {port}: {e}")
-
-        threading.Thread(target=_restart_and_verify, daemon=True).start()
-        report.append("ComfyUI is restarting - verification will complete in about 30 seconds.")
-    elif not report:
-        report.append("Nothing new to install.")
-
-    return {
-        "status": "done",
-        "report": "\n".join(report)
-    }
+    threading.Thread(target=_work, daemon=True, name="s32-node-install").start()
+    report.insert(0, f"Installing {what} — ComfyUI stops while it installs, then restarts "
+                     f"(the bar below the chat shows it).")
+    return {"status": "installing", "report": "\n".join(report)}
 
 
 
@@ -851,25 +1013,51 @@ def _remember_load(key, secs):
 _DEV_RE = re.compile(r"^\s*((?:CUDA|Vulkan|ROCm|SYCL)\d+):\s*(.+?)\s*\((\d+)\s*MiB,\s*(\d+)\s*MiB free\)")
 _BUILTIN_RE = re.compile(r"intel|microsoft|llvmpipe|swiftshader|\(tm\) graphics|^amd radeon graphics$", re.I)
 _devices_cache = {}
+_devices_lock = threading.Lock()          # one listing at a time; the next waits for its result
 
 
 def _list_devices(server):
-    """[{id, name, total, free}] from `llama-server --list-devices` (cached per server)."""
+    """[{id, name, total, free}] from `llama-server --list-devices` — or None if the listing
+    itself failed. Only a successful listing is cached. The FIRST listing on a fresh drive can
+    take well over 30 s (≈1 GB of CUDA/Vulkan DLLs read from the USB for the first time, plus
+    Windows scanning new files) — it timed out, 'no cards' was assumed, and the model ran on the
+    CPU (2026-11-05). Now: 180 s, and a failure is not 'no cards'."""
+    with _devices_lock:
+        return _list_devices_locked(server)
+
+
+def _list_devices_locked(server):
     if server in _devices_cache:
         return _devices_cache[server]
     out = []
     try:
-        r = subprocess.run([server, "--list-devices"], capture_output=True, text=True, timeout=30,
+        r = subprocess.run([server, "--list-devices"], capture_output=True, text=True, timeout=180,
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         for line in (r.stdout or "").splitlines() + (r.stderr or "").splitlines():
             m = _DEV_RE.match(line)
             if m and not any(d["id"] == m.group(1) for d in out):
                 out.append({"id": m.group(1), "name": m.group(2), "total": int(m.group(3)),
                             "free": int(m.group(4))})
+        if not out and "Available devices" not in ((r.stdout or "") + (r.stderr or "")):
+            log("[S32] Couldn't list graphics cards (llama-server gave no device list)")
+            return None
     except Exception as e:
         log(f"[S32] Couldn't list graphics cards: {e}")
+        return None
     _devices_cache[server] = out
     return out
+
+
+def warm_gpu_list():
+    """Read the card list in the background at start, so the first model load and the
+    model panel don't wait on it (it's slow the first time on a fresh drive)."""
+    def _go():
+        s = _find_llama_server()
+        if s:
+            cards = usable_gpus(s)
+            if cards:
+                log("[S32] Graphics cards found: " + ", ".join(f"{c['name']} ({c['id']})" for c in cards))
+    threading.Thread(target=_go, daemon=True, name="gpu-list").start()
 
 
 def usable_gpus(server=None):
@@ -878,6 +1066,8 @@ def usable_gpus(server=None):
     if not server:
         return []
     devs = _list_devices(server)
+    if devs is None:
+        return None                                      # couldn't be listed (≠ no cards)
     cuda = [d for d in devs if d["id"].startswith("CUDA")]
     names = {d["name"].lower() for d in cuda}
     rest = [d for d in devs if not d["id"].startswith("CUDA")
@@ -904,6 +1094,10 @@ def _device_args(server, gpus):
     if not vulkan and not isinstance(gpus, list):
         return []                                        # CUDA-only build, no setting — as before
     cards = usable_gpus(server)
+    if cards is None:
+        # Listing failed — NOT the same as 'no cards': let llama-server pick, as before.
+        log("[S32] Couldn't read the graphics card list — letting llama-server choose the card.")
+        return []
     pick = _pick_cards(cards, gpus)
     if not pick:
         log("[S32] Graphics cards all switched off (or none found) — running the model on the CPU.")
@@ -1045,8 +1239,20 @@ def start_llama_server():
 
     # If the model key is a catalog name not a path, can't use llama.cpp directly
     if model_path and not os.path.exists(model_path):
-        log(f"[S32] llama-server: model path not found: {model_path}")
-        log(f"[S32] Set lmstudio_model to a full GGUF path in config.json")
+        _store = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "LLM Storage")
+        if not any(sep in model_path for sep in ("\\", "/")) or model_path == "local-model":
+            # Nothing chosen yet (a fresh drive): not an error — say what to do (2026-11-05).
+            log(f"[S32] No language model yet — put a .gguf model in its own folder inside {_store}, "
+                f"then pick it in model switching (no restart needed).")
+            state["startup_notification"] = (
+                f"👋 Welcome! System 32 needs a language model to talk. Put a .gguf model file in its own "
+                f"folder inside {_store}, then open the ☰ menu → MODEL SWITCHING, browse to it and press Load. "
+                f"No restart needed — image generation starts with it.")
+        else:
+            log(f"[S32] llama-server: the model file isn't there any more: {model_path}")
+            state["startup_notification"] = (
+                f"⚠ The model file isn't where it was ({model_path}). Open the ☰ menu → MODEL SWITCHING and pick "
+                f"it again, or another model — no restart needed.")
         state["model_load_failed"] = True
         state["lmstudio_ready"] = True
         return
@@ -1216,6 +1422,9 @@ def start_llama_server():
                 state["vision_ready"] = (_vs == "vision")
                 _write_vision_marker(model_path, mmproj_path if _has_mmproj else "", _vs)
                 log(f"[S32] llama-server ready (vision {'on' if state['vision_ready'] else 'off'}).")
+                state["model_load_failed"] = False     # a load that failed earlier (or a first
+                                                       # boot with no model) no longer counts —
+                                                       # ComfyUI's autostart and the chat read it
                 _remember_load(_lkey, time.time() - _t0)
                 state["load_key"] = _lkey          # the 'settling in' time is kept per load key
                 state["settle_first"] = True       # the next prompt rebuild is this load's first

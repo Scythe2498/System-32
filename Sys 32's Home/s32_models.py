@@ -114,6 +114,9 @@ def clear_cache():
 
 def _manager_list():
     global _manager_cache
+    import s32_config as _cfg
+    if _cfg.airplane():
+        return []                        # not cached — the real list loads once it's off
     if _manager_cache is not None:
         return _manager_cache
     try:
@@ -200,6 +203,9 @@ def on_disk(host, folder, rel):
 def find_source(filename, folder_hint=None):
     """Where to download a model file from. Returns {url, folder, via} or None."""
     base = os.path.basename(filename).lower()
+    import s32_config as _cfg
+    if _cfg.airplane():
+        return None
     for m in _manager_list():
         if (m.get("filename") or "").lower() == base and m.get("url"):
             sp = (m.get("save_path") or "default").strip("/\\")
@@ -320,15 +326,35 @@ def list_drift(host):
     return (gone, new) if asked else None
 
 
+def _installed_stand_in(m):
+    """The installed checkpoint / LoRA the run will use in place of a missing one, or ''."""
+    try:
+        from s32_comfyui import _default_checkpoint, fetch_lora_options
+        if (m.get("folder") or "") == "checkpoints":
+            alt = _default_checkpoint(m["file"])
+            return alt if alt and alt != m["file"] else ""
+        if (m.get("folder") or "") == "loras":
+            loras = [x for x in (fetch_lora_options() or []) if x and x != "[None]"]
+            return loras[0] if loras else ""
+    except Exception:
+        pass
+    return ""
+
+
 def _handle(host, scan, auto_fetch=True):
     lines, fetching, no_source = [], [], []
     op = []          # the same story in plain words for the OPERATOR's card
 
-    if scan["nodes"]:
+    import s32_config as _cfg
+    if scan["nodes"] and _cfg.airplane():
+        names = ", ".join(scan["nodes"])
+        lines.append(f"Missing custom node(s): {names}. Airplane mode is on, so they can't be installed.")
+        op.append(f"missing node(s) {names} — airplane mode is on")
+    elif scan["nodes"]:
         names = ", ".join(scan["nodes"])
         log(f"[S32][MODELS] workflow needs missing node(s): {names}")
         state.setdefault("missing_nodes", {})["image (8188)"] = list(scan["nodes"])
-        if auto_fetch and not state.get("node_install_running"):
+        if auto_fetch and not state.get("node_install_running") and not state.get("node_install_worker"):
             state["node_install_running"] = True
             def _install():
                 try:
@@ -338,11 +364,11 @@ def _handle(host, scan, auto_fetch=True):
                 except Exception as e:
                     log(f"[S32][MODELS] node install failed: {e}")
                 finally:
-                    state["node_install_running"] = False
+                    state["node_install_running"] = False     # the worker owns the bar now
                     clear_cache()
             threading.Thread(target=_install, daemon=True).start()
         lines.append(f"Missing custom node(s): {names} — installing them now (ComfyUI "
-                     f"restarts to load them, about a minute).")
+                     f"stops while they install, then restarts — the bar below the chat shows it).")
         op.append(f"missing node(s) {names} — installing")
 
     on_disk_now = []
@@ -378,9 +404,14 @@ def _handle(host, scan, auto_fetch=True):
         else:
             _st = started if isinstance(started, dict) else {}
             if _st.get("started"):
-                lines.append(f"Missing model(s): {names}. Downloading now from a trusted source "
-                             f"— progress shows in chat.")
-                op.append(f"missing {', '.join(_st['started'])} — downloading")
+                # 'started' is a COUNT (fetch_models) — joining it crashed the whole preflight,
+                # so 'downloading now' never reached the operator (2026-11-05).
+                _skip = set(_st.get("skipped") or [])
+                _new = [os.path.basename(m["file"]) for m in fetching
+                        if os.path.basename(m["file"]) not in _skip] or [names]
+                lines.append(f"Missing model(s): {', '.join(_new)}. Downloading now from a trusted source "
+                             f"— the download bar shows its progress.")
+                op.append(f"missing {', '.join(_new)} — downloading (see the bar below)")
             if _st.get("inflight"):
                 lines.append(f"Still downloading: {', '.join(_st['inflight'])} — wait for the ✓ "
                              f"note in chat, then run it again.")
@@ -420,11 +451,35 @@ def _handle(host, scan, auto_fetch=True):
                                    m["file"], _re.I)))
     hard_missing = [m for m in no_source
                     if (m["folder"] or "") not in _SWAPPABLE or _special(m)]
-    if no_source:
+    import s32_config as _cfg
+    if no_source and _cfg.airplane():
         names = ", ".join(os.path.basename(m["file"]) for m in no_source)
-        lines.append(f"No download source found automatically for: {names}. Search the web for "
-                     f"the exact filename and use download_file, or ask the operator.")
-        op.append(f"no download source found for {names}")
+        lines.append(f"Missing: {names}. Airplane mode is on, so it can't be downloaded — tell the "
+                     f"operator; it can be fetched once airplane mode is off.")
+        op.append(f"missing {names} — airplane mode is on, so it can't be downloaded")
+    elif no_source:
+        # An ordinary checkpoint / LoRA with no known download is stood in for by one that IS
+        # installed (the auto-swap in s32_comfyui) — say THAT, not "no source found", which
+        # reads like a failure to a beginner (2026-11-05).
+        swap_lines, still = [], []
+        for m in no_source:
+            if m in hard_missing:
+                still.append(m)
+                continue
+            alt = _installed_stand_in(m)
+            fn = os.path.basename(m["file"])
+            if alt:
+                swap_lines.append(f"{fn} isn't installed and has no known download, so the "
+                                  f"installed {alt} is used instead.")
+                op.append(f"{fn} isn't installed — using {alt} instead")
+            else:
+                still.append(m)
+        lines += swap_lines
+        if still:
+            names = ", ".join(os.path.basename(m["file"]) for m in still)
+            lines.append(f"No download source found automatically for: {names}. Search the web for "
+                         f"the exact filename and use download_file, or ask the operator.")
+            op.append(f"no download source found for {names}")
 
     block = bool(scan["nodes"] or fetching or hard_missing or on_disk_now)
     if block:

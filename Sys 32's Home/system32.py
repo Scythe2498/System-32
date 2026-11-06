@@ -123,6 +123,27 @@ def _set_airplane(on):
     return res
 
 
+def _comfy_autostart(started_for):
+    """The model is up: start ComfyUI if it isn't running — once per model load (llama_gen),
+    never while a game runs, an install holds it stopped, or a model switch is under way.
+    Returns the load it has been started for (2026-11-05)."""
+    gen = state.get("llama_gen")
+    if state.get("comfy_image_ready"):
+        return gen
+    try:
+        from s32_comfyui import _comfy_start_lock as _csl
+        starting = _csl.locked()
+    except Exception:
+        starting = False
+    if (gen == started_for or starting or state.get("comfy_hold") or state.get("s32_playing")
+            or state.get("user_playing") or state.get("model_switching")
+            or is_up(CONFIG["comfy_image_host"])):
+        return started_for
+    log("[S32] Model ready and ComfyUI isn't running — starting ComfyUI...")
+    threading.Thread(target=start_comfy_image, daemon=True, name="comfy-autostart").start()
+    return gen
+
+
 def _loading_bar():
     """The input-area bar for waits that aren't downloads (2026-11-02): the model loading
     (timed against how long it took last time on this computer) and the system prompt
@@ -140,6 +161,12 @@ def _loading_bar():
         pct = min(95, int(el * 100 / exp))      # never 'done' until it actually answers
         tail = f"about {round(left)}s left" if left >= 1.5 else "almost ready…"
         return {"kind": "model", "pct": pct, "label": f"⬡ Loading {name} — {pct}%  · {tail}"}
+    ins = state.get("installing")
+    if ins:                   # a workflow's missing nodes / Python package (2026-11-05)
+        el = int(max(0, now - ins.get("started", now)))
+        verb = "Restarting" if ins.get("restart") else "Installing"
+        return {"kind": "install", "pct": None,
+                "label": f"⬡ {verb} {ins.get('what', '')} — {el}s  · for the workflow you asked for"}
     lp = state.get("load_prompt")
     if lp and now - lp.get("started", now) >= 0.8:     # a quick refresh isn't worth a flash
         # From 'Rebuilding system prompt' until the model starts answering (s32_llm): the
@@ -764,8 +791,9 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/gpus":
             try:
                 import s32_hardware
+                _cards = s32_hardware.usable_gpus()
                 self.send_json({"cards": [{"id": c["id"], "name": c["name"], "total": c["total"]}
-                                          for c in s32_hardware.usable_gpus()]})
+                                          for c in (_cards or [])], "listed": _cards is not None})
             except Exception as e:
                 self.send_json({"cards": [], "error": str(e)})
         elif self.path == "/api/downloads":
@@ -5604,7 +5632,10 @@ function commitVisionFps(v){ _visionSet({fps: parseInt(v,10)}); }
 let _gpuCards = null, _gpuPref = null, _gpusFetching = false;
 async function refreshGpus(){
   if(_gpuCards || _gpusFetching) return; _gpusFetching = true;
-  try{ const d = await fetch('/api/gpus').then(r=>r.json()); _gpuCards = d.cards||[]; _renderGpus(); }
+  try{ const d = await fetch('/api/gpus').then(r=>r.json());
+       // Only keep a real list — an empty answer (cards not read yet on a fresh drive) is
+       // asked again next time the panel opens (2026-11-05).
+       if(d.cards && d.cards.length){ _gpuCards = d.cards; _renderGpus(); } }
   catch(e){} finally{ _gpusFetching = false; }
 }
 function _setGpuPref(sd){
@@ -7375,14 +7406,19 @@ def startup():
             waited += 3
 
         if state.get("model_load_failed"):
-            log("[S32] Model failed to load — skipping ComfyUI startup to conserve resources.")
-            log("[S32] Use the model switcher to select a valid model, then restart.")
+            log("[S32] No model running yet — ComfyUI starts as soon as one is loaded "
+                "(model switching; no restart needed).")
             return
 
         log("[S32] Model ready — starting ComfyUI...")
         start_comfy_image()
 
     threading.Thread(target=_start_model_then_comfy, daemon=True).start()
+    try:                                  # the card list, early (slow the first time on a fresh drive)
+        import s32_hardware as _s32hw
+        _s32hw.warm_gpu_list()
+    except Exception:
+        pass
 
     # Index of this computer's files (all drives, read-only) for search_computer.
     try:
@@ -7398,14 +7434,19 @@ def startup():
     except Exception as _se:
         log(f"[S32][SEARX] not available: {_se}")
 
-    # Monitor: shut down ComfyUI if model unloads
+    # Monitor: shut down ComfyUI if model unloads — and START it when a model comes up
+    # and ComfyUI isn't running (2026-11-05). A first boot with no model skipped ComfyUI,
+    # and loading a model afterwards never started it (the revive monitor only revives a
+    # ComfyUI that was up once), so the operator had to restart System 32. Once per load.
     def _comfy_model_monitor():
         import subprocess as _sp
         was_ready = False
+        started_for = None
         while True:
             time.sleep(15)
             if state["lmstudio_ready"] and not state.get("model_load_failed"):
                 was_ready = True
+                started_for = _comfy_autostart(started_for)
             if was_ready and not state["lmstudio_ready"]:
                 log("[S32] Model unloaded — shutting down ComfyUI to free resources.")
                 try:
