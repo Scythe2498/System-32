@@ -433,6 +433,7 @@ def _settle_done():
 
 def _settle_clear():
     """The request ended without an answer (error / stopped) — no time kept, no bar left."""
+    state["first_reply_gen"] = state.get("llama_gen")   # the RAM guard's watch ends here
     state.pop("on_first_token", None)
     lp = state.get("load_prompt")
     if lp and lp.get("phase") == "reading":
@@ -638,7 +639,7 @@ TOOLS_SPEC = [
     {"type":"function","function":{"name":"show_images","description":"Show images inline in chat from a folder or specific paths. Use count=24 when asked to pick favorites or browse - you can actually see the images displayed, so pick based on what you see not filenames. Use random_sample=true to draw from the entire library randomly. Use page=N to paginate through results in batches.","parameters":{"type":"object","properties":{"folder":{"type":"string"},"count":{"type":"integer","description":"How many to show, up to 24"},"paths":{"type":"array","items":{"type":"string"}},"random_sample":{"type":"boolean","description":"Sample randomly from entire folder instead of most recent"},"page":{"type":"integer","description":"Page number for pagination, starts at 1"}}}}},
     {"type":"function","function":{"name":"mark_favorite","description":"Save an image to your favorites list with a reason. Use this when you see an image you genuinely like while browsing. Your favorites persist across sessions.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Full path to the image file"},"reason":{"type":"string","description":"Why you like it - composition, subject, mood, technique"}},"required":["path"]}}},
     {"type":"function","function":{"name":"get_favorites","description":"Retrieve your saved favorites list - images you've chosen to keep track of across sessions.","parameters":{"type":"object","properties":{}}}},
-    {"type":"function","function":{"name":"visual_search","description":"Find images visually similar to a reference image using perceptual hashing. Fast, no GPU needed. Requires visual index to be built first. Use threshold 10 for very similar, 20 for somewhat similar, 30 for loosely similar.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Path to the reference image"},"top_n":{"type":"integer","description":"Number of results to return"},"threshold":{"type":"integer","description":"Max visual distance 0-64, lower=more similar, default 15"}},"required":["path"]}}},
+    {"type":"function","function":{"name":"visual_search","description":"ONLY the images System 32 itself generated (its output index): near-identical copies by perceptual hash. For pictures anywhere else on the computer, or anything looser than a copy, use find_similar_on_computer instead. Use threshold 10 for very similar, 20 for somewhat similar, 30 for loosely similar.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Path to the reference image"},"top_n":{"type":"integer","description":"Number of results to return"},"threshold":{"type":"integer","description":"Max visual distance 0-64, lower=more similar, default 15"}},"required":["path"]}}},
     {"type":"function","function":{"name":"build_visual_index","description":"Build or update the visual hash index for the output folder. Must be run before visual_search works. Takes a few minutes for large libraries. Use force=true to rebuild from scratch.","parameters":{"type":"object","properties":{"force":{"type":"boolean","description":"Rebuild from scratch instead of updating"}}}}},
     {"type":"function","function":{"name":"remember_operator","description":"Record the name of the person at this computer when they tell you what to call them (a new computer is a new person). Saves it to this computer's profile.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"What they want to be called"}},"required":["name"]}}},
     {"type":"function","function":{"name":"set_preference","description":"Save operator preferences to the machine or operator profile. Saves multiple preferences in ONE call using extra parameter. Machine preferences override hardware defaults automatically. Common keys: width, height, steps, cfg, video_width, video_height, video_fps, video_duration, checkpoint, notes.","parameters":{"type":"object","properties":{"key":{"type":"string","description":"Primary preference key"},"value":{"type":"string","description":"Primary preference value"},"scope":{"type":"string","description":"'machine' for this machine (default), 'operator' for all machines"},"extra":{"type":"object","description":"Additional key-value pairs to save in same call e.g. {\"height\":\"1024\",\"video_height\":\"512\"}"}},"required":["key","value"]}}},
@@ -661,6 +662,8 @@ TOOLS_SPEC = [
     {"type":"function","function":{"name":"get_screen_status","description":"Check whether screen capture is running and its settings.","parameters":{"type":"object","properties":{}}}},
     {"type":"function","function":{"name":"web_search","description":"Search the web and get back the top results (title, URL, snippet). Use when the operator asks you to look something up, find current information, check a fact, or research a topic you don't already know. Routes through System 32's controlled web layer (logged, proxy-aware). After searching, open a promising result with web_fetch to read it.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"What to search for"},"max_results":{"type":"integer","description":"How many results, 1-10 (default 6)"}},"required":["query"]}}},
     {"type":"function","function":{"name":"web_image_search","description":"Search the web for IMAGES and show them as a thumbnail grid in chat. Use when the operator wants to SEE pictures of something (e.g. show me images of X, what does X look like, reference pics, examples). Different from web_search, which returns text links. Routes through System 32 controlled web layer.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"What images to find"},"max_results":{"type":"integer","description":"How many images, 1-30 (default 12)"}},"required":["query"]}}},
+    {"type":"function","function":{"name":"find_similar_on_computer","description":"Find the operator's OWN pictures on this computer that look like an image (the attached one, '#1', 'last', or a file path) - same picture, copies, near-copies, or the same kind of shot - OR (mode=duplicates, no image needed) find groups of duplicate / near-duplicate pictures in folders. Compares what the pictures LOOK like, not their names; fully offline. The first look through a folder takes a while (shown on the input bar), then it's instant. Results are shown as a grid. Afterwards ASK what to do with them: move or copy them into a folder, put duplicates in the Recycle Bin (keeping one), sort them, or use them in a workflow / dataset / another tool - then act with the exact paths it returns.","parameters":{"type":"object","properties":{"image":{"type":"string","description":"The reference picture if none is attached: '#1', 'last', a file name or a full path"},"folders":{"type":"array","items":{"type":"string"},"description":"Folders to look in (full paths). Leave empty for every drive (slow the first time)"},"mode":{"type":"string","enum":["similar","duplicates"],"description":"similar = pictures like the image (default); duplicates = groups of copies within the folders"},"closeness":{"type":"string","enum":["same","near-identical","very close","similar","related"],"description":"How alike they must be (default similar). 'same' = only copies of the very same picture"},"recursive":{"type":"boolean","description":"Include subfolders (default true)"},"max_results":{"type":"integer","description":"How many to show, 1-200 (default 40)"}}}}},
+    {"type":"function","function":{"name":"find_similar_images","description":"PRIVATE reverse image search: find pictures on the web that look like one of the operator's images (the one attached, or one named like '#1', 'last' or a file name) - same subject, same style, or copies of the very same picture. The image is NEVER uploaded: only your search phrases go out, and each picture found is compared to it right here on this computer. Use when the operator asks to find similar images, where an image came from, other copies, or more like this. Look at the image yourself and write the phrases.","parameters":{"type":"object","properties":{"image":{"type":"string","description":"Which image, if none is attached this turn: '#1', 'last', a file name or path"},"queries":{"type":"array","items":{"type":"string"},"description":"2-4 short image-search phrases (3-8 words), the way the picture would be TITLED online. If you can read ANY text in it (watermark, signature, logo, caption, a site name, a photographer or artist credit), make that one phrase on its own - it is the best way to find the original. If you are SURE what/where it is (a landmark, product, species, game, film), name it - but never guess who a person is from their face, and never add artist or actor names for a style or a look: a wrong name sends every search the wrong way. Describe people by what is visible (clothing, pose, setting). Then main subject + setting, and the kind of picture (photo, painting, 3D render, anime, meme) in plain words."},"max_results":{"type":"integer","description":"How many matches to show, 1-30 (default 12)"}},"required":["queries"]}}},
     {"type":"function","function":{"name":"web_video_search","description":"Search the web for VIDEOS (YouTube and other sites) and show them as cards in chat, each with Open and Download buttons. Use when the operator wants videos, clips, trailers, tutorials or gameplay footage. Different from web_search (text pages) and web_image_search (pictures).","parameters":{"type":"object","properties":{"query":{"type":"string","description":"What videos to find"},"max_results":{"type":"integer","description":"How many videos, 1-20 (default 8)"}},"required":["query"]}}},
     {"type":"function","function":{"name":"file_operation","description":"Copy, move, rename, delete files/folders or make a new folder on this computer — NATIVELY (never write a script for this). You PROPOSE it; the operator gets a Confirm card listing exactly what will happen, and nothing changes until they press Confirm. Delete goes to the Recycle Bin. Name clashes get _1 (nothing is overwritten). Not allowed: System 32's own drive, Windows / Program Files, network drives. Find the real paths first (search_computer / list_directory). SEVERAL operations in a row (e.g. make folder test2, move test1's files into it, delete test1) = ONE call with `steps` — one Confirm card, run in that order, stopping at the first step that fails.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["copy","move","rename","delete","mkdir"],"description":"What to do (leave out when using steps)"},"paths":{"type":"array","items":{"type":"string"},"description":"Full paths of the files or folders to act on (a folder + filter = the matching files inside it)"},"destination":{"type":"string","description":"copy/move: the folder to put them in (created if missing). mkdir: the new folder's full path"},"filter":{"type":"string","description":"With a folder in paths: which files inside — images, videos, audio, all, or a pattern like *.png;*.jpg. Leave empty to act on the folder itself"},"recursive":{"type":"boolean","description":"With filter: include subfolders"},"new_name":{"type":"string","description":"rename: the new name (just the name, no folder)"},"steps":{"type":"array","description":"Several operations run in order on ONE Confirm card. Each item has the same fields: action, paths, destination, filter, recursive, new_name. Example: [{\"action\":\"mkdir\",\"destination\":\"C:\\…\\Desktop\\test2\"},{\"action\":\"move\",\"paths\":[\"C:\\…\\Desktop\\test1\"],\"filter\":\"all\",\"destination\":\"C:\\…\\Desktop\\test2\"},{\"action\":\"delete\",\"paths\":[\"C:\\…\\Desktop\\test1\"]}]","items":{"type":"object"}}},"required":[]}}},
     {"type":"function","function":{"name":"search_computer","description":"Find anything on THIS COMPUTER — every drive, including spare and external/USB drives — by file and folder names, instantly (System 32 keeps an index). kind=image or video: the matches are shown to the operator in chat (a picture grid / video cards with a More results button). kind=code, folder, document, audio, model, program or any: you get a list of paths. Read-only — nothing is changed. Use this for any 'find / look for / where is / show me … on my computer'.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Words that would be in the file or folder name, e.g. 'red fox', 'skyrim vr vive focus 3'"},"kind":{"type":"string","enum":["any","image","video","code","config","folder","document","audio","model","program","archive"],"description":"What sort of file. config = settings files (.ini .toml .cfg .json .yaml .xml) — a mod's or game's settings often live OUTSIDE its folder (e.g. Documents\\My Games\\<game>\\…)"},"max_results":{"type":"integer","description":"How many to show first (default 24 pictures / 8 videos / 25 files)"}},"required":["query"]}}},
@@ -686,7 +689,7 @@ TOOLS_SPEC_MINIMAL = [t for t in TOOLS_SPEC if t["function"]["name"] in _MINIMAL
 
 # Airplane mode: the tools that only exist to reach the internet aren't offered at all —
 # she answers from what's here instead of trying and failing (2026-10-31).
-_WEB_ONLY_TOOLS = {"web_search", "web_fetch", "web_image_search", "web_video_search", "download_file"}
+_WEB_ONLY_TOOLS = {"web_search", "web_fetch", "web_image_search", "find_similar_images", "web_video_search", "download_file"}
 
 
 def _tools_now():
@@ -728,7 +731,7 @@ TOOL_NAMES = {
     "favorite_path", "get_favorite_paths", "remove_favorite_path",
     "get_system_state", "watch_path",
     "scan_network", "propose_security_action",
-    "web_search", "web_fetch", "web_image_search", "web_video_search", "export_training_data", "download_file",
+    "web_search", "web_fetch", "web_image_search", "find_similar_images", "find_similar_on_computer", "web_video_search", "export_training_data", "download_file",
     "search_computer", "import_code", "compare_code", "search_code", "edit_code", "file_operation",
     "review_lessons", "whitelist_ports", "game_input",
     "see_screen", "start_screen_capture", "stop_screen_capture", "get_screen_status",
@@ -1437,12 +1440,29 @@ def _rec_flag(name):
     except Exception:
         pass
 
+def _wait_voice_quiet(limit=300):
+    """The summary is a second request to the model; while the voice reads a long reply,
+    that burst of work starves the voice engine (it runs on the CPU) and the speech
+    stutters (2026-11-08). So wait until the voice has finished — at most 5 minutes."""
+    try:
+        import voice as _v
+    except Exception:
+        return
+    t0 = time.time()
+    while time.time() - t0 < limit:
+        s = _v._state
+        if not (s.get("queue") or s.get("audio") or s.get("speaking") or s.get("stream")):
+            return
+        time.sleep(0.25)
+
+
 def summarize_thought(text):
     """1-3 line plain summary of a reasoning block, for the chat pane's thought header.
     Separate, tool-less, thinking-off call; requested by the UI only AFTER a turn ends."""
     text = (text or "").strip()
     if not text:
         return ""
+    _wait_voice_quiet()
     try:
         resp = http_post(
             f"{CONFIG['lmstudio_host']}/v1/chat/completions",
@@ -1893,6 +1913,60 @@ def _tool_result_summary(tool_name, result):
                 f"({result.get('format', 'chat')} format) to:\n{result.get('path', '')}\n\n"
                 f"Tell the operator it's saved and ready to fine-tune with. Do NOT export "
                 f"again unless they ask for a fresh one.")
+
+    if tool_name == "find_similar_on_computer":
+        if result.get("error"):
+            return result["error"]
+        rs = result.get("results", [])
+        stop = (" (The operator stopped the first look-through early, so only part of it was "
+                "compared; asking again carries on where it stopped.)") if result.get("stopped") else ""
+        if not rs:
+            return (f"Compared {result.get('checked', 0)} picture(s) in {result.get('where')} - nothing "
+                    f"{'duplicated' if result.get('mode') == 'duplicates' else 'alike enough'}.{stop} "
+                    f"Tell the operator; a looser closeness or other folders may find more.")
+        if result.get("mode") == "duplicates":
+            lines = [f"Compared {result.get('checked', 0)} picture(s) in {result.get('where')}: "
+                     f"{result.get('groups', 0)} group(s) of duplicates, {result.get('total', 0)} picture(s) "
+                     f"(showing {len(rs)}) - ALREADY shown as a grid.{stop} In each group the one marked KEEP "
+                     f"has the most pixels (oldest first on a tie):"]
+            for r in rs[:80]:
+                w, h = (r.get("size") or (0, 0))
+                lines.append(f"group {r['group']} [{'KEEP' if r.get('keep') else r.get('label')}] {w}x{h} {r['path']}")
+        else:
+            lines = [f"Compared {result.get('checked', 0)} picture(s) in {result.get('where')} with "
+                     f"{result.get('image')}: {result.get('total', 0)} alike (showing {len(rs)}, best first) - "
+                     f"ALREADY shown as a grid.{stop}"]
+            for r in rs[:80]:
+                lines.append(f"[{r.get('label')}, {r.get('score', 0):.2f}] {r['path']}")
+        if len(rs) > 80:
+            lines.append(f"...and {len(rs) - 80} more in the grid.")
+        lines.append("")
+        lines.append("Now ASK the operator what to do with them (unless they already said): move or copy them "
+                     "into a folder, put the duplicates in the Recycle Bin and keep one, sort them, or use them "
+                     "in a workflow, dataset or another tool. Then act with these EXACT paths - for files, ONE "
+                     "file_operation call with steps (they confirm it). Never delete a KEEP picture or the "
+                     "operator's reference picture. Don't search again unless they ask.")
+        return "\n".join(lines)
+
+    if tool_name == "find_similar_images":
+        if result.get("error"):
+            return result["error"]
+        rs = result.get("results", [])
+        lines = [f"Compared {result.get('checked', 0)} web picture(s) with {result.get('image', 'the image')} "
+                 f"on this computer (searched: {'; '.join(result.get('queries', []))}). The best "
+                 f"{len(rs)} are ALREADY shown to the operator as a grid, best first. "
+                 f"{result.get('exact', 0)} look like the very same picture. Matches:"]
+        for i, r in enumerate(rs, 1):
+            tag = "SAME IMAGE" if r.get("same_image") else f"{r.get('label') or 'similar'}, {r.get('score', 0):.2f}"
+            lines.append(f"{i}. [{tag}] {r.get('title') or '(no title)'} — page: {r.get('page') or '?'}")
+        lines.append("")
+        if not result.get("exact"):
+            lines.append("No exact copy turned up. If you can think of better words for it (a name, a "
+                         "title, text in the picture), you may offer to search again with those.")
+        lines.append("Tell the operator briefly what turned up (copies first, with where they're posted). "
+                     "Scores are 0-1 picture similarity: ~0.75+ is the same kind of picture, 0.9+ nearly "
+                     "the same shot. The image was never uploaded. Do NOT search again unless they ask.")
+        return "\n".join(lines)
 
     if tool_name == "web_image_search":
         if result.get("error"):

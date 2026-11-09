@@ -1910,16 +1910,20 @@ def _ensure_voice_packages(script_dir):
     py = os.path.join(script_dir, "python", "python.exe")
     if not os.path.exists(py) or AIRPLANE:
         return
-    need = [pkg for pkg, mod in (("kokoro-onnx", "kokoro_onnx"), ("sounddevice", "sounddevice"))
+    # faster-whisper = speech INPUT (s32_stt). Installed here too (2026-11-08): installing it
+    # from inside the running System 32 never became importable on a fresh drive.
+    need = [pkg for pkg, mod in (("kokoro-onnx", "kokoro_onnx"), ("sounddevice", "sounddevice"),
+                                 ("faster-whisper", "faster_whisper"))
             if subprocess.run([py, "-c", f"import {mod}"], capture_output=True).returncode != 0]
     for pkg in need:
-        pr(f"Installing {pkg}...")
+        pr(f"Installing {pkg}{' (speech input, one-time, ~150 MB)' if pkg == 'faster-whisper' else ''}...")
         r = subprocess.run([py, "-m", "pip", "install", pkg, "--quiet"],
-                           capture_output=True, text=True, timeout=900)
+                           capture_output=True, text=True, timeout=1800)
         if r.returncode == 0:
             ok(f"{pkg} installed")
         else:
-            warn(f"{pkg} install failed — voice may stay off: "
+            what = "speech input (the mic) may not work" if pkg == "faster-whisper" else "voice may stay off"
+            warn(f"{pkg} install failed — {what}: "
                  + ((r.stderr or "").strip().splitlines() or ["?"])[-1][:160])
 
 

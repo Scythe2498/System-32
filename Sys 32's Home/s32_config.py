@@ -44,7 +44,7 @@ except ImportError:
 
 # System 32's version. Raise it with every release on GitHub (tag vX.Y.Z) — the update
 # check compares the newest release against this (s32_update.py).
-VERSION = "0.9.2"
+VERSION = "0.9.3"
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -821,6 +821,16 @@ def cancellable_post_stream(url, data, timeout=300, on_delta=None):
             _rc = delta.get("reasoning_content") or delta.get("reasoning")
             if _rc:
                 reasoning_parts.append(_rc)
+            elif reasoning_parts and (delta.get("content") or delta.get("tool_calls")):
+                # The thinking is finished — the reply (or a tool call) starts now. Hand it
+                # over at once, so the chat shows it above the reply instead of after the
+                # whole turn — a Stop mid-reply used to lose it (2026-11-08).
+                _rd = state.pop("on_reasoning_done", None)
+                if _rd:
+                    try:
+                        _rd("".join(reasoning_parts))
+                    except Exception:
+                        pass
             if delta.get("content"):
                 content_parts.append(delta["content"])
                 if on_delta:

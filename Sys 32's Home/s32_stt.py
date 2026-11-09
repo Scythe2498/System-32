@@ -46,13 +46,17 @@ _stt = state.setdefault("stt", {
 
 
 def _load_pref():
-    """Restore saved mic + mode (does NOT auto-start listening — mic stays off)."""
+    """Restore saved mic + mode (does NOT auto-start listening — mic stays off).
+    The mic is kept by NAME (2026-11-08): Windows renumbers devices whenever a Bluetooth
+    headset connects or disconnects, so a saved number pointed at the wrong device."""
     try:
         with open(_PREF, encoding="utf-8") as f:
             p = json.load(f)
         if isinstance(p, dict):
-            if "device" in p:
-                _stt["device"] = p["device"]
+            if p.get("device_name"):
+                _stt["device_name"] = str(p["device_name"])
+            elif "device" in p:
+                _stt["device"] = p["device"]          # an old number-only preference
             if p.get("mode") in ("continuous", "ptt"):
                 _stt["mode"] = p["mode"]
     except Exception:
@@ -62,7 +66,7 @@ def _load_pref():
 def _save_pref():
     try:
         with open(_PREF, "w", encoding="utf-8") as f:
-            json.dump({"device": _stt.get("device"),
+            json.dump({"device_name": _stt.get("device_name"),
                        "mode": _stt.get("mode", "continuous")}, f)
     except Exception:
         pass
@@ -86,24 +90,67 @@ def _sd():
     return sd
 
 
+def _inputs(sd):
+    """[(index, name)] — each microphone ONCE. Windows lists every mic under several audio
+    systems (MME, DirectSound, WASAPI, WDM-KS) and some of those entries can't be opened
+    ('Invalid device [-9996]', 2026-11-08 with a Bluetooth headset). MME is the one that
+    opens almost anything (it converts sample rates, handles Bluetooth hands-free), so
+    when it exists only its entries are listed."""
+    devices = sd.query_devices()
+    try:
+        apis = [a.get("name", "") for a in sd.query_hostapis()]
+    except Exception:
+        apis = []
+    mme = apis.index("MME") if "MME" in apis else None
+    out, seen = [], set()
+    for i, d in enumerate(devices):
+        if d.get("max_input_channels", 0) <= 0:
+            continue
+        if mme is not None and d.get("hostapi") != mme:
+            continue
+        name = d.get("name", f"Device {i}")
+        if name in seen or "sound mapper" in name.lower():
+            continue
+        seen.add(name)
+        out.append((i, name))
+    return out
+
+
+def _resolve_device(sd):
+    """The saved mic's CURRENT number (by name), or None = Windows' default mic."""
+    name = _stt.get("device_name")
+    if name:
+        ins = _inputs(sd)
+        for i, n in ins:
+            if n == name:
+                return i
+        for i, n in ins:                              # MME cuts names at 31 characters
+            if name.startswith(n) or n.startswith(name):
+                return i
+        return None
+    dev = _stt.get("device")
+    if isinstance(dev, int):
+        try:
+            if sd.query_devices(dev).get("max_input_channels", 0) > 0:
+                return dev
+        except Exception:
+            pass
+    return None
+
+
 def list_microphones():
-    """Input devices for the dropdown: [{index, name, default}]."""
+    """Input devices for the dropdown: [{index, name, default}] — each mic once."""
     try:
         sd = _sd()
-        devices = sd.query_devices()
         try:
             default_in = sd.default.device[0]
+            default_name = sd.query_devices(default_in).get("name", "") if default_in is not None and default_in >= 0 else ""
         except Exception:
-            default_in = -1
-        mics = []
-        for i, d in enumerate(devices):
-            if d.get("max_input_channels", 0) > 0:
-                mics.append({
-                    "index":   i,
-                    "name":    d.get("name", f"Device {i}"),
-                    "default": (i == default_in),
-                })
-        return {"devices": mics, "selected": _stt.get("device"),
+            default_in, default_name = -1, ""
+        mics = [{"index": i, "name": n,
+                 "default": (i == default_in or (default_name and n == default_name))}
+                for i, n in _inputs(sd)]
+        return {"devices": mics, "selected": _resolve_device(sd),
                 "enabled": _stt.get("enabled", False), "mode": _stt.get("mode", "continuous"),
                 "error": _stt.get("error")}
     except Exception as e:
@@ -117,8 +164,15 @@ def set_microphone(index):
         idx = int(index) if index not in (None, "", "default") else None
     except (TypeError, ValueError):
         idx = None
+    name = None
+    if idx is not None:
+        try:
+            name = _sd().query_devices(idx).get("name")
+        except Exception:
+            name = None
     with _lock:
         _stt["device"] = idx
+        _stt["device_name"] = name
     _save_pref()
     if _stt.get("enabled"):
         stop_listening()
@@ -161,24 +215,31 @@ def start_listening():
             return {"ok": True, "enabled": True, "already": True}
         try:
             sd = _sd()
-            dev = _stt.get("device")
-            # Whisper wants 16 kHz; try it directly (PortAudio resamples on many
-            # devices), else fall back to the device's native rate + resample later.
-            sr = 16000
+            dev = _resolve_device(sd)
+            note = None
             try:
-                sd.check_input_settings(device=dev, samplerate=16000, channels=1, dtype="float32")
-            except Exception:
-                sr = _device_samplerate(sd, dev)
+                _stream, sr = _open(sd, dev)
+            except Exception as e:
+                if dev is None:
+                    raise
+                # The chosen mic won't open (a Bluetooth headset not in its hands-free
+                # mode, unplugged, in use…) — use Windows' default mic and say so.
+                log(f"[S32][STT] '{_stt.get('device_name') or dev}' couldn't be opened ({e}) — "
+                    f"using the default microphone")
+                note = (f"'{_stt.get('device_name') or dev}' couldn't be opened, so the default "
+                        f"microphone is used. (A Bluetooth headset's mic often only works as its "
+                        f"'Headset' / hands-free entry, and only when no other app holds it.)")
+                dev = None
+                _stream, sr = _open(sd, None)
             _stt["samplerate"] = sr
-            _stream = sd.InputStream(
-                device=dev, channels=1, samplerate=sr,
-                blocksize=max(256, int(sr / 10)),    # ~100 ms blocks
-                dtype="float32", callback=_level_callback,
-            )
             _stream.start()
             _stt["enabled"] = True
-            _stt["error"]   = None
-            log(f"[S32][STT] listening (device={dev}, {sr} Hz)")
+            _stt["error"]   = note
+            try:
+                _nm = sd.query_devices(dev if dev is not None else sd.default.device[0]).get("name", dev)
+            except Exception:
+                _nm = dev
+            log(f"[S32][STT] listening ({_nm}, {sr} Hz)")
             _ensure_model()                          # warm up faster-whisper in the background
             return {"ok": True, "enabled": True}
         except Exception as e:
@@ -187,6 +248,20 @@ def start_listening():
             _stt["error"]   = str(e)[:140]
             log(f"[S32][STT] start failed: {e}")
             return {"ok": False, "enabled": False, "error": str(e)[:140]}
+
+
+def _open(sd, dev):
+    """→ (InputStream, rate). Whisper wants 16 kHz; try it directly (most devices convert),
+    else the device's own rate (resampled later)."""
+    sr = 16000
+    try:
+        sd.check_input_settings(device=dev, samplerate=16000, channels=1, dtype="float32")
+    except Exception:
+        sr = _device_samplerate(sd, dev)
+    s = sd.InputStream(device=dev, channels=1, samplerate=sr,
+                       blocksize=max(256, int(sr / 10)),      # ~100 ms blocks
+                       dtype="float32", callback=_level_callback)
+    return s, sr
 
 
 def stop_listening():
@@ -276,16 +351,46 @@ def _resample_16k(x):
                      np.linspace(0, 1, len(x), endpoint=False), x).astype("float32")
 
 
+_HOME = os.path.dirname(os.path.abspath(__file__))
+_MODEL_DIR = os.path.join(_HOME, "whisper_models")   # on the drive, not C:\Users\…\.cache
+
+# The model download library (huggingface_hub): no usage reporting (privacy), and no
+# harmless-but-alarming warnings in the cmd window — symlinks aren't available on a
+# USB drive without admin, and System 32 downloads anonymously on purpose (2026-11-08).
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+os.environ.setdefault("HF_HUB_VERBOSITY", "error")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
+
 def _pip_install_whisper():
+    """Install faster-whisper into System 32's own Python (setup normally does this first).
+    → (ok, message). The result is logged — it used to fail silently (2026-11-08)."""
     import sys
     import subprocess
     try:
-        subprocess.run([sys.executable, "-m", "pip", "install", "faster-whisper",
-                        "--break-system-packages", "--quiet"],
-                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                       timeout=900)
+        r = subprocess.run([sys.executable, "-m", "pip", "install", "faster-whisper", "--quiet"],
+                           capture_output=True, text=True, timeout=1800,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except Exception as e:
-        log(f"[S32][STT] engine install failed: {str(e)[:120]}")
+        log(f"[S32][STT] speech engine install failed: {str(e)[:160]}")
+        return False, str(e)[:160]
+    if r.returncode != 0:
+        err = [l for l in (r.stderr or "").splitlines() if l.strip() and not l.startswith("[notice]")]
+        msg = (err[-1] if err else f"pip exited {r.returncode}")[:200]
+        log(f"[S32][STT] speech engine install failed: {msg}")
+        return False, msg
+    # A package installed while Python runs isn't importable until the import caches are
+    # refreshed (same fix as voice.py, 2026-11-01).
+    import importlib, site
+    importlib.invalidate_caches()
+    try:
+        for p in site.getsitepackages():
+            site.addsitedir(p)
+    except Exception:
+        pass
+    log("[S32][STT] speech engine (faster-whisper) installed")
+    return True, ""
 
 
 def _probe_transcribe(model):
@@ -313,15 +418,43 @@ def _load_model():
         try:
             import faster_whisper  # noqa: F401
         except ImportError:
-            _stt["model_msg"] = "installing speech engine (one-time, a couple min)…"
-            log("[S32][STT] faster-whisper not present — installing into bundled python")
-            _pip_install_whisper()
-        from faster_whisper import WhisperModel
+            import s32_config as _cfg
+            if _cfg.airplane():
+                _stt["model_status"] = "error"
+                _stt["model_msg"] = "the speech engine isn't installed and airplane mode is on"
+                log("[S32][STT] faster-whisper not installed, and airplane mode is on")
+                return
+            _stt["model_msg"] = "installing the speech engine (one-time, a few minutes)…"
+            log("[S32][STT] faster-whisper not present — installing into System 32's Python")
+            ok, why = _pip_install_whisper()
+            if not ok:
+                _stt["model_status"] = "error"
+                _stt["model_msg"] = f"speech engine install failed: {why[:100]}"
+                return
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError as e:
+            _stt["model_status"] = "error"
+            _stt["model_msg"] = "the speech engine was installed — restart System 32 to use it"
+            log(f"[S32][STT] faster-whisper installed but not importable yet ({e}) — needs a restart")
+            return
         size = CONFIG.get("stt_model", "small")
-        _stt["model_msg"] = f"loading {size} model…"
+        os.makedirs(_MODEL_DIR, exist_ok=True)
+        have = any(size in d for d in os.listdir(_MODEL_DIR)) if os.path.isdir(_MODEL_DIR) else False
+        import s32_config as _cfg
+        if not have and _cfg.airplane():
+            _stt["model_status"] = "error"
+            _stt["model_msg"] = f"the '{size}' speech model isn't downloaded yet and airplane mode is on"
+            log(f"[S32][STT] whisper '{size}' not on the drive yet, and airplane mode is on")
+            return
+        _stt["model_msg"] = (f"loading {size} model…" if have else
+                             f"downloading the {size} speech model onto the drive (one-time, ~480 MB)…")
         for dev, ct in (("cuda", "int8_float16"), ("cpu", "int8")):
             try:
-                m = WhisperModel(size, device=dev, compute_type=ct)
+                # Once the model is on the drive, never contact Hugging Face again
+                # (faster-whisper otherwise checks for updates online every boot).
+                m = WhisperModel(size, device=dev, compute_type=ct, download_root=_MODEL_DIR,
+                                 local_files_only=have)
                 # End-to-end probe: WhisperModel() can SUCCEED on cuda even when a
                 # runtime CUDA DLL it only needs at transcribe time is missing
                 # (cublas64_12.dll on the portable drive) — so STT would load "on
@@ -343,12 +476,14 @@ def _load_model():
                     pass
         _stt["model_status"] = "error"
         _stt["model_msg"] = "model load failed (see log)"
-    except ImportError:
+    except ImportError as e:
         _stt["model_status"] = "error"
         _stt["model_msg"] = "speech engine install failed"
+        log(f"[S32][STT] speech engine unavailable: {e}")
     except Exception as e:
         _stt["model_status"] = "error"
         _stt["model_msg"] = str(e)[:120]
+        log(f"[S32][STT] speech engine failed: {str(e)[:160]}")
 
 
 def _ensure_model():

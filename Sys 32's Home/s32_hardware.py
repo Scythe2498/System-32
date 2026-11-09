@@ -1112,6 +1112,147 @@ def _device_args(server, gpus):
     return ["--device", pick[0]["id"]]
 
 
+# ── RAM guard (2026-11-07, the operator's idea) ──────────────────────────────
+# A model too big for the computer fills the RAM; Windows then swaps to disk and the whole
+# computer crawls or locks up — a beginner can't tell why. While a model loads AND through
+# its first reply (when the context memory fills), RAM at ≥98 % for 5 s straight unloads
+# the model and puts up a banner saying what was full and what to change. Only RAM for now
+# (CPU / GPU-busy / drive reach 98 % during NORMAL loading and replies). Not watched after
+# the first reply, so ComfyUI using RAM later can't unload the model.
+_RAM_LIMIT = 98.0
+_RAM_SECONDS = 5.0
+
+
+def _ram_percent():
+    try:
+        import psutil
+        return float(psutil.virtual_memory().percent)
+    except Exception:
+        return None
+
+
+def _top_ram_users(n=3):
+    try:
+        import psutil
+        rows = []
+        for p in psutil.process_iter(["name", "memory_info"]):
+            try:
+                rows.append((p.info["memory_info"].rss, p.info["name"] or "?"))
+            except Exception:
+                pass
+        rows.sort(reverse=True)
+        return [{"name": nm, "gb": round(rss / 2**30, 1)} for rss, nm in rows[:n]]
+    except Exception:
+        return []
+
+
+def _overload_advice(model_path, ctx, gpu_layers, kv_cache, gpus):
+    """What to change, most useful first — from what's known about this model + computer."""
+    tips = []
+    try:
+        size_gb = os.path.getsize(model_path) / 2**30
+    except Exception:
+        size_gb = 0
+    try:
+        import psutil
+        ram_gb = psutil.virtual_memory().total / 2**30
+    except Exception:
+        ram_gb = 0
+    cards = [c for c in (usable_gpus() or [])] if _devices_cache else []
+    vram_gb = sum(c["total"] for c in cards) / 1024 if cards else 0
+    try:
+        n_layers = int((read_gguf_caps(model_path) or {}).get("n_layers") or 0)
+    except Exception:
+        n_layers = 0
+    if size_gb and ram_gb and size_gb > 0.8 * (ram_gb + vram_gb):
+        tips.append(f"This model file is {size_gb:.0f} GB — too big for {ram_gb:.0f} GB of RAM"
+                    + (f" + {vram_gb:.0f} GB on the graphics cards" if vram_gb else "")
+                    + ". Use a smaller quant of it (Q4_K_M is about half the size of Q8).")
+    if isinstance(gpus, list) and cards and len([c for c in cards if c["name"] in gpus]) < len(cards):
+        tips.append("Switch on another graphics card in GRAPHICS CARDS, so less of the model sits in RAM.")
+    if n_layers and gpu_layers is not None and 0 <= int(gpu_layers) < n_layers and cards:
+        tips.append(f"Raise GPU LAYERS (now {gpu_layers} of {n_layers}) — every layer on the graphics "
+                    f"card is one less in RAM. If the card fills up, lower it again.")
+    if ctx and int(ctx) > 32768:
+        tips.append(f"Lower CONTEXT (now {int(ctx):,}) — 32,768 needs far less memory.")
+    if str(kv_cache or "f16") == "f16":
+        tips.append("Set KV CACHE to q8_0 — the context memory takes about half the space.")
+    if size_gb and not tips:
+        tips.append("Use a smaller model or quant — this one doesn't fit this computer.")
+    return tips[:4]
+
+
+def _start_ram_guard(gen, proc, model_path, ctx, gpu_layers, kv_cache, gpus):
+    """Watch RAM from llama-server's start through its first reply (see the block above)."""
+    state["first_reply_gen"] = None
+    before = _ram_percent()
+
+    def _watch():
+        over_since = None
+        ready_at = None
+        while True:
+            time.sleep(0.5)
+            if state.get("llama_gen") != gen or proc.poll() is not None:
+                return                                    # replaced / stopped / crashed
+            if state.get("first_reply_gen") == gen:
+                return                                    # first reply done — job done
+            if state.get("lmstudio_ready_gen") == gen:
+                ready_at = ready_at or time.time()
+                if time.time() - ready_at > 600:
+                    return                                # loaded, no message for 10 min: stop
+                                                          # (so ComfyUI later can't unload it)
+            pct = _ram_percent()
+            if pct is None:
+                return
+            if pct < _RAM_LIMIT:
+                over_since = None
+                continue
+            over_since = over_since or time.time()
+            if time.time() - over_since < _RAM_SECONDS:
+                continue
+            # Overloaded: unload, explain.
+            try:
+                import psutil
+                vm = psutil.virtual_memory()
+                used, total = vm.used / 2**30, vm.total / 2**30
+            except Exception:
+                used = total = 0
+            top = _top_ram_users()
+            name = os.path.splitext(os.path.basename(model_path))[0]
+            log(f"[S32] RAM at {pct:.0f}% for {_RAM_SECONDS:.0f}s while {name} was loading/answering "
+                f"— unloading it so the computer doesn't lock up")
+            state["llama_cancel"] = gen
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                host = CONFIG.get("lmstudio_host", "http://localhost:1234")
+                _kill_llama_on_port(int(host.split(":")[-1]) if ":" in host else 1234)
+            except Exception:
+                pass
+            state["load_model"] = None
+            state["model_switching"] = False
+            state["model_load_failed"] = True
+            state["lmstudio_ready"] = True              # the UI stays usable
+            state["overload"] = {
+                "resource": "RAM", "percent": round(pct), "seconds": int(_RAM_SECONDS),
+                "used_gb": round(used, 1), "total_gb": round(total, 1),
+                "before": round(before) if before is not None else None,
+                "model": name, "top": top, "when": time.time(),
+                "phase": "loading" if not state.get("lmstudio_ready_gen") == gen else "first reply",
+                "tips": _overload_advice(model_path, ctx, gpu_layers, kv_cache, gpus),
+            }
+            return
+
+    threading.Thread(target=_watch, daemon=True, name="s32-ram-guard").start()
+
+
+def dismiss_overload():
+    state["overload"] = None
+    return {"ok": True}
+
+
 def cancel_llama_load():
     """The ✕ on the model loading bar (2026-11-02): stop a load that's taking too long or has
     hung. The wait loop sees the cancel and stops quietly; the model panel can load again."""
@@ -1385,6 +1526,7 @@ def start_llama_server():
         )
         tie_to_s32(proc, "llama-server")      # ends with System 32, however it closes
         _llama_proc["proc"] = proc            # for the loading bar's ✕
+        _start_ram_guard(my_gen, proc, model_path, ctx, gpu_layers, kv_cache, gpus)
 
         def _log_tail(path, n=1400):
             try:
@@ -1427,6 +1569,8 @@ def start_llama_server():
                                                        # ComfyUI's autostart and the chat read it
                 _remember_load(_lkey, time.time() - _t0)
                 state["load_key"] = _lkey          # the 'settling in' time is kept per load key
+                state["lmstudio_ready_gen"] = my_gen
+                state["overload"] = None           # a model that fits clears an old warning
                 state["settle_first"] = True       # the next prompt rebuild is this load's first
                 _check_gpu_used(_llama_log, gpu_layers)
                 state["lmstudio_ready"] = True

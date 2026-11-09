@@ -42,6 +42,9 @@ _state = {
     "current":      None,       # text currently being spoken
     "lock":         threading.Lock(),
     "stop_flag":    False,
+    "gen":          0,          # bumped by stop_voice(): older queued speech is dropped
+    "audio":        [],         # synthesized sentences waiting to play: (gen, samples, rate, text)
+    "stream":       None,       # the reply being spoken sentence by sentence (begin_stream)
     "kokoro":       None,       # Kokoro model instance
     "voices":       [],         # available voices
     "piper_exe":    None,       # path to piper.exe
@@ -260,104 +263,112 @@ def _init_piper():
 # ── Speech loop ─────────────────────────────────────────────────────────────────
 
 def _speech_loop():
-    """Background thread that processes speech requests from the queue."""
+    """Two stages (2026-11-08): this thread PLAYS; a second one SYNTHESIZES the next sentence
+    while the current one plays, so sentences follow each other without gaps. Every item
+    carries the 'gen' it was queued in — stop_voice() bumps it, and older items are dropped."""
+    threading.Thread(target=_synth_loop, daemon=True, name="voice-synth").start()
     while True:
-        time.sleep(0.1)
+        time.sleep(0.01)
         if not _state["enabled"] or not _state["ready"]:
             continue
         with _state["lock"]:
-            if not _state["queue"]:
+            if not _state["audio"]:
                 continue
-            text = _state["queue"].pop(0)
-
-        if text and not _state["stop_flag"]:
-            _speak_now(text)
-
-        _state["stop_flag"] = False
+            gen, samples, rate, text = _state["audio"].pop(0)
+        if gen != _state["gen"]:
+            continue
+        _play(samples, rate, text)
 
 
-def _speak_now(text):
-    """Actually synthesize and play audio for the given text."""
+def _synth_loop():
+    while True:
+        time.sleep(0.03)
+        if not _state["enabled"] or not _state["ready"]:
+            continue
+        with _state["lock"]:
+            if not _state["queue"] or len(_state["audio"]) >= 2:     # stay ≤2 sentences ahead
+                continue
+            item = _state["queue"].pop(0)
+        gen, text = item if isinstance(item, tuple) else (_state["gen"], item)
+        if gen != _state["gen"] or not text:
+            continue
+        out = _synth(text)
+        if out and gen == _state["gen"]:
+            with _state["lock"]:
+                _state["audio"].append((gen, out[0], out[1], text))
+
+
+def _play(samples, rate, text):
     try:
-        voice = _state["voice"] or "af_bella"   # built-in default (matches reset_voice_default)
+        import sounddevice as sd
+    except ImportError:
+        _log("[Voice] sounddevice not available — cannot play audio")
+        return
+    try:
+        _state["speaking"] = True
+        _state["current"] = text
+        _log(f"[Voice] Playing: {text[:50]} | voice={_state['voice'] or 'af_bella'} | rate={rate}")
+        sd.play(samples, rate)
+        sd.wait()                          # stop_voice() → sd.stop() ends this at once
+    except Exception as e:
+        _log(f"[Voice] Playback error: {e}")
+    finally:
+        _state["speaking"] = False
+        _state["current"] = None
 
-        # Route to Piper if voice starts with "piper:"
-        if voice.startswith("piper:"):
-            _speak_piper(text, voice)
-            return
 
-        try:
-            import sounddevice as sd
-        except ImportError:
-            _log("[Voice] sounddevice not available — cannot play audio")
-            return
+def _synth(text):
+    """→ (samples, sample_rate) for one sentence, or None. Kokoro or Piper."""
+    voice = _state["voice"] or "af_bella"   # built-in default (matches reset_voice_default)
+    try:
         import numpy as np
-
+        if voice.startswith("piper:"):
+            return _synth_piper(text, voice)
         kokoro = _state["kokoro"]
         if not kokoro:
-            return
-        speed = _state["speed"]
-
-        _state["speaking"] = True
-        _state["current"]  = text
-
-        # Synthesize
-        samples, sample_rate = kokoro.create(
-            text,
-            voice=voice,
-            speed=speed,
-            lang="en-us",
-        )
-
-        # Apply volume
+            return None
+        samples, sample_rate = kokoro.create(text, voice=voice, speed=_state["speed"], lang="en-us")
         vol = _state["volume"]
         if vol != 1.0:
             samples = (samples * vol).astype(samples.dtype)
-
-        # Play — blocks until done
-        _log(f"[Voice] Playing: {text[:50]} | voice={voice} | rate={sample_rate}")
-        sd.play(samples, sample_rate)
-        sd.wait()
-        _log("[Voice] Playback complete.")
-
+        return samples, sample_rate
     except Exception as e:
         import traceback
         _log(f"[Voice] Speech error: {e}")
         _log(f"[Voice] Detail: {traceback.format_exc().splitlines()[-1]}")
-    finally:
-        _state["speaking"] = False
-        _state["current"]  = None
+        return None
+
+
+def _speak_now(text):
+    """Synthesize and play one piece of text right away (blocking)."""
+    out = _synth(text)
+    if out:
+        _play(out[0], out[1], text)
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def speak(text, priority=False):
     """
-    Queue text for speech.
-    priority=True: clear queue and speak immediately.
+    Queue text for speech, sentence by sentence (no length cap — 2026-11-08: a 500-char cap
+    cut long replies off mid-way). priority=True: stop what's playing and speak this now.
     Returns immediately — speech plays in background.
     """
     if not text or not text.strip():
         return {"status": "empty"}
-
     if not _state["enabled"]:
         return {"status": "disabled"}
-
     if not _state["ready"]:
         return {"status": "not_ready", "hint": "Voice is still initializing."}
-
-    # Clean the text — remove markdown, asterisks, emoji-heavy content
-    clean = _clean_for_speech(text)
-    if not clean.strip():
+    if priority:
+        stop_voice()
+    parts = [c for c in (_clean_for_speech(s) for s in _split_sentences(text)) if c.strip()]
+    if not parts:
         return {"status": "nothing_to_say"}
-
+    gen = _state["gen"]
     with _state["lock"]:
-        if priority:
-            _state["stop_flag"] = True
-            _state["queue"] = [clean]
-        else:
-            _state["queue"].append(clean)
-
+        _state["queue"].extend((gen, p) for p in parts)
+    clean = " ".join(parts)
     return {
         "status":   "queued",
         "voice":    _state["voice"],
@@ -367,16 +378,109 @@ def speak(text, priority=False):
 
 
 def stop_voice():
-    """Stop current speech and clear the queue."""
+    """Stop current speech and drop everything queued — including sentences of a reply
+    that's still streaming in (the Stop button, or a new message from the operator)."""
+    with _state["lock"]:
+        _state["gen"] += 1
+        _state["queue"] = []
+        _state["audio"] = []
+        _state["stop_flag"] = True
+        _state["stream"] = None
     try:
         import sounddevice as sd
         sd.stop()
     except Exception:
         pass
-    with _state["lock"]:
-        _state["queue"] = []
-        _state["stop_flag"] = True
     return {"status": "stopped"}
+
+
+# ── Speaking a reply WHILE it's written (2026-11-08) ─────────────────────────
+# The reply used to be spoken only after the whole turn finished. Now the chat feeds the
+# streamed text in; each finished sentence is spoken as soon as it's complete.
+import re as _re
+_ABBREV = {"e.g", "i.e", "etc", "vs", "mr", "mrs", "ms", "dr", "st", "no", "fig", "approx", "ca"}
+_END_RE = _re.compile(r'[.!?…]+["\')\]]*(?=\s)')
+
+
+def _boundaries(buf, final=False):
+    """Character positions where a sentence ends in buf (only those already followed by
+    enough text to be sure). Paragraph breaks and line breaks also end a piece."""
+    cuts = []
+    for m in _END_RE.finditer(buf):
+        end = m.end()
+        rest = buf[end:]
+        nxt = rest.lstrip()
+        if not nxt and not final:
+            continue                                   # wait: don't know what follows yet
+        if nxt and not (nxt[0].isupper() or nxt[0].isdigit() or nxt[0] in "\"'(*_#-[" or "\n" in rest[:len(rest) - len(nxt)]):
+            continue                                   # "e.g. the" / "5070 Ti. and" — not an end
+        word = _re.findall(r'([A-Za-z.]+)$', buf[:m.start()])
+        if word and (word[0].lower().rstrip(".") in _ABBREV or (len(word[0]) == 1 and word[0].isupper())):
+            continue                                   # "Dr. Smith", "J. R."
+        cuts.append(end)
+    for m in _re.finditer(r'\n\s*\n|\n(?=\s*(?:[-*+]\s|\d+\.\s|#))', buf):
+        cuts.append(m.start())                         # paragraphs / list items / headings
+    return sorted(set(cuts))
+
+
+def _split_sentences(text):
+    text = text or ""
+    out, start = [], 0
+    for c in _boundaries(text, final=True):
+        if c > start and text[:c].count("```") % 2 == 0:     # never inside a code block
+            out.append(text[start:c]); start = c
+    if text[start:].strip():
+        out.append(text[start:])
+    return [s.strip() for s in out if s.strip()]
+
+
+def begin_stream():
+    """A new reply starts: whatever was still being said stops; this reply is spoken
+    sentence by sentence as it arrives (feed / end_stream)."""
+    stop_voice()
+    with _state["lock"]:
+        _state["stream"] = {"gen": _state["gen"], "buf": "", "said": 0}
+    return _state["gen"]
+
+
+def feed(text):
+    """More of the reply arrived. Complete sentences go to the speech queue now."""
+    st = _state.get("stream")
+    if not st or st["gen"] != _state["gen"] or not text:
+        return
+    st["buf"] += text
+    _flush(st, final=False)
+
+
+def end_stream():
+    """The reply is complete: say whatever is left."""
+    st = _state.get("stream")
+    if not st or st["gen"] != _state["gen"]:
+        return
+    _flush(st, final=True)
+    _state["stream"] = None
+
+
+def _flush(st, final):
+    pending = st["buf"][st["said"]:]
+    if not pending.strip():
+        return
+    cut = 0
+    for c in _boundaries(pending, final=final):
+        if pending[:c].count("```") % 2 == 0:          # never split inside a code block
+            cut = c
+    if final:
+        cut = len(pending)
+    if cut <= 0:
+        return
+    chunk = pending[:cut]
+    st["said"] += cut
+    if not (_state["enabled"] and _state["ready"]):
+        return
+    parts = [c for c in (_clean_for_speech(s) for s in _split_sentences(chunk)) if c.strip()]
+    with _state["lock"]:
+        if st["gen"] == _state["gen"]:
+            _state["queue"].extend((st["gen"], p) for p in parts)
 
 
 def list_voices():
@@ -478,77 +582,57 @@ def enable_voice(enabled=True):
     return {"status": "enabled" if enabled else "disabled"}
 
 
-def _speak_piper(text, voice_key):
-    """Synthesize text using Piper TTS and play via sounddevice."""
+def _synth_piper(text, voice_key):
+    """Synthesize text with Piper → (samples, sample_rate) or None. Playing is shared (_play)."""
     import subprocess, tempfile, wave
-    try:
-        import sounddevice as sd
-        import numpy as np
-    except ImportError:
-        _log("[Voice] sounddevice not available for Piper playback")
-        return
-
+    import numpy as np
     piper_exe = _state.get("piper_exe")
     onnx_path = _state["piper_voices"].get(voice_key)
     if not piper_exe or not onnx_path:
         _log(f"[Voice] Piper voice not found: {voice_key}")
-        return
-
+        return None
     json_path = onnx_path + ".json"
+    tmp_path = None
     try:
-        _state["speaking"] = True
-        _state["current"]  = text
-
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             tmp_path = tmp.name
-
-        piper_dir = os.path.dirname(piper_exe)
-        # Synthesis time scales with text length. The old fixed 30s ceiling killed
-        # Piper mid-synthesis on long messages, so the reply "cut out" (the except
-        # below fired and nothing played). Scale the ceiling with length, with a
-        # generous floor, so only a genuine hang trips it.
         _synth_timeout = max(120, len(text) // 8)
         try:
             result = subprocess.run(
-                [piper_exe, "--model", onnx_path, "--config", json_path,
-                 "--output_file", tmp_path],
-                input=text.encode("utf-8"),
-                capture_output=True,
-                cwd=piper_dir,
-                timeout=_synth_timeout
-            )
+                [piper_exe, "--model", onnx_path, "--config", json_path, "--output_file", tmp_path],
+                input=text.encode("utf-8"), capture_output=True, cwd=os.path.dirname(piper_exe),
+                timeout=_synth_timeout,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except subprocess.TimeoutExpired:
-            _log(f"[Voice] Piper synthesis timed out after {_synth_timeout}s "
-                 f"({len(text)} chars). Nothing played.")
-            return
+            _log(f"[Voice] Piper synthesis timed out after {_synth_timeout}s ({len(text)} chars).")
+            return None
         if result.returncode != 0:
             _log(f"[Voice] Piper error: {result.stderr.decode('utf-8', errors='replace')[:200]}")
-            return
-
-        # Read and play wav
+            return None
         with wave.open(tmp_path, "rb") as wf:
             sample_rate = wf.getframerate()
             frames = wf.readframes(wf.getnframes())
-            samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
-
+        samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
         vol = _state["volume"]
         if vol != 1.0:
             samples = samples * vol
-
-        _log(f"[Voice] Piper playing: {text[:50]} | voice={voice_key}")
-        sd.play(samples, sample_rate)
-        sd.wait()
-        _log("[Voice] Piper playback complete.")
-
+        return samples, sample_rate
     except Exception as e:
         _log(f"[Voice] Piper speech error: {e}")
+        return None
     finally:
-        _state["speaking"] = False
-        _state["current"]  = None
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+
+def _speak_piper(text, voice_key):
+    """Kept for callers of the old name: synthesize with Piper and play."""
+    out = _synth_piper(text, voice_key)
+    if out:
+        _play(out[0], out[1], text)
 
 
 # ── Text cleaning ─────────────────────────────────────────────────────────────
@@ -592,15 +676,7 @@ def _clean_for_speech(text):
     # Trim
     text = text.strip()
 
-    # Cap length — don't speak more than ~500 chars at once
-    if len(text) > 500:
-        # Find a sentence break near 500
-        cutoff = text.rfind('. ', 0, 500)
-        if cutoff > 200:
-            text = text[:cutoff+1]
-        else:
-            text = text[:500] + "..."
-
+    # No length cap any more: text arrives here one sentence at a time (2026-11-08).
     return text
 
 

@@ -742,6 +742,23 @@ def _dispatch_impl(name, params, img_bytes=None):
     if name == "web_image_search":
         yield (_web_image_search(params.get("query", ""), params.get("max_results", 12))
                if _web_image_search else {"error": "Web access unavailable."}); return
+    if name == "find_similar_on_computer":
+        # The same matching on the operator's own pictures — nothing goes online.
+        try:
+            from s32_similar import find_similar_on_computer as _fsc
+        except Exception as e:
+            yield {"error": f"Image matching unavailable: {e}"}; return
+        yield _fsc(params.get("image"), params.get("folders"), params.get("mode", "similar"),
+                   params.get("closeness", "similar"), params.get("recursive", True),
+                   params.get("max_results", 40), img_bytes=img_bytes); return
+    if name == "find_similar_images":
+        # Private reverse image search: only WORDS go out; the picture is compared here.
+        try:
+            from s32_similar import find_similar_images as _fsi
+        except Exception as e:
+            yield {"error": f"Image matching unavailable: {e}"}; return
+        yield _fsi(params.get("image"), params.get("queries"),
+                   params.get("max_results", 12), img_bytes=img_bytes); return
     if name == "web_video_search":
         yield (_web_video_search(params.get("query", ""), params.get("max_results", 8))
                if _web_video_search else {"error": "Web access unavailable."}); return

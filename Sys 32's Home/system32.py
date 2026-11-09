@@ -68,6 +68,13 @@ def _auto_speak(text):
         pass
 
 
+def _voice_on():
+    try:
+        return bool(_voice and _voice._state.get("ready") and _voice._state.get("voice"))
+    except Exception:
+        return False
+
+
 def _trace_label(name, params):
     """Compact one-line label for a tool call, shown inline in chat as a trace."""
     p = params or {}
@@ -167,6 +174,14 @@ def _loading_bar():
         verb = "Restarting" if ins.get("restart") else "Installing"
         return {"kind": "install", "pct": None,
                 "label": f"⬡ {verb} {ins.get('what', '')} — {el}s  · for the workflow you asked for"}
+    if state.get("scanning"):    # find_similar_on_computer's first look through the pictures
+        try:
+            import s32_similar
+            sb = s32_similar.scan_bar()
+            if sb:
+                return sb
+        except Exception:
+            pass
     lp = state.get("load_prompt")
     if lp and now - lp.get("started", now) >= 0.8:     # a quick refresh isn't worth a flash
         # From 'Rebuilding system prompt' until the model starts answering (s32_llm): the
@@ -435,6 +450,32 @@ def _drop_note(dropped):
                  "If they didn't say, tell them what the file is and ask what to do with it.]")
     return "\n\n" + "\n".join(lines), ok
 
+
+
+def open_folder(path):
+    """Open the folder holding `path` in a new Explorer window, the file selected (or just
+    the folder when the file is gone, e.g. after a dedupe). → {"ok": …} / {"error": …}"""
+    import subprocess as _sp
+    p = str(path or "").strip().strip('"')
+    if not p or '"' in p or not os.path.isabs(p):
+        return {"error": "no such folder"}
+    p = os.path.normpath(p)
+    if p.startswith("\\\\") or p.startswith("//"):
+        return {"error": "network folders aren't opened from here"}
+    target = p if os.path.isdir(p) else os.path.dirname(p)
+    if not os.path.isdir(target):
+        return {"error": "that folder isn't there any more"}
+    try:
+        if os.name == "nt":
+            if os.path.isfile(p):
+                _sp.Popen(f'explorer /select,"{p}"')     # opens the folder, picture highlighted
+            else:
+                os.startfile(target)
+        else:
+            _sp.Popen(["xdg-open", target], stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+        return {"ok": True, "folder": target}
+    except Exception as e:
+        return {"error": f"couldn't open it: {str(e)[:120]}"}
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
@@ -764,6 +805,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(s32_irondome.iron_dome_status())
             except Exception as e:
                 self.send_json({"error": str(e), "ports": [], "whitelist": {"ports": [], "procs": []}})
+        elif self.path.startswith("/api/update/releases"):
+            # The changelog (DATA · SAVE · RESET panel) — fetched only when the panel opens.
+            try:
+                import s32_update
+                self.send_json(s32_update.releases(refresh="refresh=1" in self.path))
+            except Exception as e:
+                self.send_json({"error": str(e)})
         elif self.path == "/api/update/status":
             try:
                 import s32_update
@@ -806,6 +854,7 @@ class Handler(BaseHTTPRequestHandler):
                 d["loading"] = _loading_bar()
             except Exception:
                 d["loading"] = None
+            d["overload"] = state.get("overload")       # the RAM guard's banner (2026-11-07)
             self.send_json(d)
         elif self.path == "/api/tuning":
             try:
@@ -1262,7 +1311,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self.send_json({"error": str(e)})
         elif self.path in ("/api/update/check", "/api/update/apply", "/api/update/dismiss",
-                           "/api/update/rollback"):
+                           "/api/update/rollback", "/api/update/install"):
             try:
                 import s32_update
                 act = self.path.rsplit("/", 1)[1]
@@ -1272,8 +1321,8 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(s32_update.apply(body.get("version", "")))
                 elif act == "dismiss":
                     self.send_json(s32_update.dismiss(body.get("version", "")))
-                else:
-                    self.send_json(s32_update.rollback())
+                else:                                 # install / rollback: a listed release
+                    self.send_json(s32_update.install(body.get("version", "")))
             except Exception as e:
                 self.send_json({"error": str(e)})
         elif self.path == "/api/egress/baseline":
@@ -1421,6 +1470,11 @@ class Handler(BaseHTTPRequestHandler):
                                                          body.get("note", "")))
             except Exception as e:
                 self.send_json({"error": str(e)})
+        elif self.path == "/api/open_folder":
+            # Click a picture's folder name → Explorer opens there with the picture
+            # selected (2026-11-08). Local drives only: a network path (\\server\…) would
+            # make Windows contact that server.
+            self.send_json(open_folder(body.get("path")))
         elif self.path == "/api/activity/cancel":
             # The input bar's ✕ — cancels whatever the bar is showing.
             what = body.get("what", "")
@@ -1432,6 +1486,12 @@ class Handler(BaseHTTPRequestHandler):
                 elif what == "batch":
                     import s32_comfyui
                     out = s32_comfyui.cancel_comfy_jobs("input bar")
+                elif what == "overload":                  # the RAM guard's banner: OK
+                    import s32_hardware
+                    out = s32_hardware.dismiss_overload()
+                elif what == "scan":                      # looking through the pictures (2026-11-08)
+                    import s32_similar
+                    out = s32_similar.cancel_scan()
                 elif what == "model":                     # the model loading bar (2026-11-02)
                     import s32_hardware
                     out = s32_hardware.cancel_llama_load()
@@ -1744,6 +1804,14 @@ class Handler(BaseHTTPRequestHandler):
                         log("[S32] Client disconnected mid-stream — going silent for this turn.")
 
                 _got_delta = {"v": False}
+                # Voice (2026-11-08): a new message cuts off whatever was still being said,
+                # and this reply is spoken sentence by sentence AS it streams in.
+                _speaking = _voice_on()
+                try:
+                    if _voice:
+                        _voice.begin_stream() if _speaking else _voice.stop_voice()
+                except Exception:
+                    _speaking = False
                 def _on_delta(t):
                     if not t:
                         return
@@ -1751,6 +1819,11 @@ class Handler(BaseHTTPRequestHandler):
                         _got_delta["v"] = True
                         chunk({"phase": "start"})   # open a fresh live bubble
                     chunk({"phase": "delta", "text": t})
+                    if _speaking:
+                        try:
+                            _voice.feed(t)
+                        except Exception:
+                            pass
 
                 # When files are attached they're injected into the prompt (not read via
                 # read_file), so no tool traces fire — leaving only the spinner during a
@@ -1765,12 +1838,22 @@ class Handler(BaseHTTPRequestHandler):
 
                 state["turn_req_full"] = (doc_prefix + user_text if doc_prefix else user_text) + att_note
                 _cards0 = state.get("confirm_cards", 0)
+                # The thought goes on screen the moment the thinking ends (above the reply),
+                # not after the whole turn — so a Stop mid-reply no longer loses it (2026-11-08).
+                _thought_sent = {"v": False}
+                def _early_thought(text):
+                    text = (text or "").strip()
+                    if text:
+                        _thought_sent["v"] = True
+                        chunk({"phase": "thought", "text": text})
+                state["on_reasoning_done"] = _early_thought
                 spoken, tool_name, tool_params = chat(
                     (doc_prefix + user_text if doc_prefix else user_text) + att_note,
                     _llm_image, on_delta=_on_delta)
                 _prompt_cache["locked"] = True  # lock prompt for duration of this turn
-                _th = _pop_thought(user_text)
-                if _th:
+                state.pop("on_reasoning_done", None)
+                _th = _pop_thought(user_text)          # always logged to thoughts.log
+                if _th and not _thought_sent["v"]:
                     chunk({"phase": "thought", "text": _th})
 
                 # It thought, then stopped without a word or a tool call (2026-10-29: "how
@@ -1855,7 +1938,12 @@ class Handler(BaseHTTPRequestHandler):
                 # ack, or a tool-call with no preamble) push the text as a bubble now.
                 if spoken and not _got_delta["v"]:
                     chunk({"phase": "text", "response": spoken, "tool": tool_name})
-                if spoken:
+                if _got_delta["v"] and _speaking:
+                    try:
+                        _voice.end_stream()        # say the last sentence (already spoken as it came)
+                    except Exception:
+                        pass
+                elif spoken:
                     _auto_speak(spoken)
 
                 if not tool_name:
@@ -2134,7 +2222,8 @@ class Handler(BaseHTTPRequestHandler):
                         # saw barely two results, no pages, and kept searching (2026-10-28).
                         _cap = (7000 if current_tool in ("run_unreal_python", "write_code", "run_code", "edit_code")
                                 else 9000 if current_tool in ("web_search", "web_fetch")
-                                else 3000 if current_tool in ("web_image_search", "web_video_search")
+                                else 3000 if current_tool in ("web_image_search", "web_video_search", "find_similar_images")
+                                else 9000 if current_tool == "find_similar_on_computer"
                                 else 4000 if current_tool == "search_computer"
                                 else 7000 if current_tool == "import_code"
                                 else 12000 if current_tool in ("read_file", "show_file", "compare_code", "search_code") else 8000 if current_tool == "explore_tree" else 600)
@@ -2952,6 +3041,25 @@ body::after{content:'';position:fixed;inset:0;background-image:linear-gradient(r
 #upd-banner button{background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:3px 10px;font-family:var(--mono);font-size:12px;cursor:pointer}
 #upd-banner button:hover{border-color:var(--accent);color:var(--accent)}
 #upd-banner #upd-go{border-color:var(--accent);color:#000;background:var(--accent);font-weight:700}
+.chlog-item{background:var(--bg3);border:1px solid var(--border);border-radius:4px;padding:6px 8px}
+.chlog-row{display:flex;align-items:center;gap:8px}
+.chlog-row .v{font-family:var(--mono);font-size:12px;font-weight:700;color:var(--fg)}
+.chlog-row .d{font-size:9px;color:var(--muted)}
+.chlog-row .tag{font-size:9px;color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:0 4px}
+.chlog-row button{margin-left:auto;background:transparent;border:1px solid var(--border);color:var(--fg);border-radius:4px;padding:2px 8px;font-size:10px;cursor:pointer;font-family:var(--mono)}
+.chlog-row button:hover{border-color:var(--accent);color:var(--accent)}
+.chlog-row button.new{border-color:var(--accent);color:var(--accent)}
+.chlog-item details{margin-top:4px}
+.chlog-item summary{font-size:10px;color:var(--muted);cursor:pointer}
+.chlog-item pre{white-space:pre-wrap;font-size:10px;color:var(--fg);margin:4px 0 0;max-height:180px;overflow:auto;font-family:var(--mono)}
+#ovl-banner{display:none;flex-wrap:wrap;align-items:flex-start;gap:6px 10px;padding:8px 14px;background:linear-gradient(90deg,rgba(255,59,59,.18),rgba(255,170,0,.08));border-bottom:1px solid #ff3b3b;font-family:var(--mono);font-size:13px;z-index:49}
+#ovl-banner #ovl-icon{color:#ff3b3b;font-size:15px}
+#ovl-banner #ovl-text{flex:1 1 300px}
+#ovl-banner ul{margin:4px 0 0;padding-left:18px;font-size:12px;color:var(--text)}
+#ovl-banner .ovl-top{font-size:11px;color:var(--muted);margin-top:3px}
+#ovl-banner button{background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:3px 10px;font-family:var(--mono);font-size:12px;cursor:pointer}
+#ovl-banner button:hover{border-color:#ff3b3b;color:#ff3b3b}
+#ovl-banner #ovl-go{border-color:#ff3b3b;color:#000;background:#ff3b3b;font-weight:700}
 #upd-banner #upd-notes{display:none;flex-basis:100%;margin:4px 0 2px;padding:8px 10px;max-height:220px;overflow:auto;white-space:pre-wrap;background:rgba(0,0,0,.35);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:12px}
 #sec-banner{display:none;align-items:center;gap:10px;padding:8px 14px;background:linear-gradient(90deg,rgba(255,64,96,.18),rgba(255,170,0,.10));border-bottom:1px solid var(--accent2);font-family:var(--mono);font-size:13px;z-index:50;box-shadow:0 0 18px rgba(255,64,96,.25);animation:secpulse 2.4s ease-in-out infinite}
 @keyframes secpulse{0%,100%{box-shadow:0 0 14px rgba(255,64,96,.18)}50%{box-shadow:0 0 26px rgba(255,64,96,.42)}}
@@ -3018,6 +3126,8 @@ body::after{content:'';position:fixed;inset:0;background-image:linear-gradient(r
 .thought{margin:4px 0 4px 8px;border-left:2px solid var(--accent3);padding:2px 0 2px 8px;font-family:var(--mono);font-size:10.5px;color:var(--muted)}
 .thought>summary{cursor:pointer;color:var(--accent3);opacity:.85;list-style:none;white-space:pre-wrap;word-break:break-word}
 .thought>summary::-webkit-details-marker{display:none}
+.thought>summary::after{content:'\25B8';display:inline-block;margin-left:6px;transition:transform .15s}
+.thought[open]>summary::after{transform:rotate(90deg)}
 .thought .tsum{color:var(--fg);opacity:.75}
 .thought .tsteps{color:var(--accent3);opacity:.7}
 .thought pre .tsep{display:block;margin:8px 0 6px;color:var(--accent3);opacity:.6}
@@ -3050,6 +3160,8 @@ body.hide-thoughts .thought{display:none}
 .imgsrc{position:absolute;left:0;right:0;bottom:0;font-family:var(--mono);font-size:8.5px;color:var(--sub);background:linear-gradient(transparent,rgba(0,0,0,.78));padding:10px 5px 3px;text-decoration:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;opacity:0;transition:opacity .15s}
 .imgcell:hover .imgsrc{opacity:1}
 .imgsrc:hover{color:var(--accent)}
+.imgdir{cursor:pointer}
+.imgdir:hover{text-decoration:underline}
 .imgdl{position:absolute;top:4px;right:4px;width:24px;height:24px;border-radius:50%;border:1px solid var(--border);background:rgba(0,0,0,.62);color:var(--text);font-size:12px;line-height:22px;text-align:center;cursor:pointer;opacity:0;transition:opacity .15s,border-color .15s;padding:0}
 .imgcell:hover .imgdl,.imgdl.busy,.imgdl.done,.imgdl.err{opacity:1}
 .imgdl:hover{border-color:var(--accent);color:var(--accent)}
@@ -3591,6 +3703,15 @@ input[type=checkbox]:focus-visible{outline:1px solid var(--k);outline-offset:2px
           <div style="font-size:9px;color:var(--muted);margin-bottom:6px;line-height:1.4">Erase everything anyone has done with System 32 on this drive &mdash; every person's memories, chats, files, generations and save states. Only what's needed to run stays.</div>
           <button onclick="showFactoryReset()" style="width:100%;background:transparent;color:#e05555;border:2px solid #e05555;border-radius:4px;padding:8px;font-size:12px;cursor:pointer;font-weight:700;letter-spacing:1px">FACTORY RESET</button>
         </div>
+        <div style="margin-top:14px;padding-top:10px;border-top:1px solid var(--border)">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:2px">
+            <span style="font-size:10px;color:var(--muted);letter-spacing:2px">&#128220; CHANGELOG</span>
+            <span id="chlog-ver" style="font-size:9px;color:var(--muted)"></span>
+          </div>
+          <div style="font-size:9px;color:var(--muted);margin-bottom:6px;line-height:1.4">The last three releases, read from GitHub. Rolling back downloads that version and installs it &mdash; your memories, settings, outputs and models aren't touched.</div>
+          <div id="chlog-list" style="display:flex;flex-direction:column;gap:6px"></div>
+          <div id="chlog-status" style="font-size:9px;color:var(--muted);margin-top:4px;min-height:11px"></div>
+        </div>
       </div>
     </div>
 
@@ -3748,11 +3869,12 @@ input[type=checkbox]:focus-visible{outline:1px solid var(--k);outline-offset:2px
       <button id="upd-go" onclick="updApply()">Update</button>
       <button id="upd-later" onclick="updLater()">Not now</button>
     </span>
-    <span id="upd-roll" style="display:none">
-      <button id="upd-roll-btn" onclick="updRollback()">Roll back</button>
-      <button onclick="updHide()">OK</button>
-    </span>
     <pre id="upd-notes"></pre>
+  </div>
+  <div id="ovl-banner">
+    <span id="ovl-icon">⚠</span>
+    <span id="ovl-text"></span>
+    <span><button id="ovl-go" onclick="ovlFix()">Model switching</button> <button onclick="ovlOk()">OK</button></span>
   </div>
   <div id="sec-banner">
     <span id="sec-icon">⚠</span>
@@ -3953,6 +4075,37 @@ async function poll(){
 }
 setInterval(poll,2000); poll();
 
+// ── RAM guard banner (2026-11-07): the model was unloaded because RAM was full ──
+let _ovlShown = null;
+function _showOverload(o){
+  const b = document.getElementById('ovl-banner'); if(!b) return;
+  if(!o){ b.style.display = 'none'; _ovlShown = null; return; }
+  if(_ovlShown === o.when) return;
+  _ovlShown = o.when;
+  const t = document.getElementById('ovl-text');
+  t.textContent = '';
+  const head = document.createElement('div');
+  head.innerHTML = '<b></b>';
+  head.querySelector('b').textContent = `${o.model} was unloaded — your computer's RAM was ${o.percent}% full for ${o.seconds} seconds`;
+  head.appendChild(document.createTextNode(` (${o.used_gb} of ${o.total_gb} GB, during the ${o.phase}). It's too big for this computer with these settings. Try:`));
+  t.appendChild(head);
+  const ul = document.createElement('ul');
+  (o.tips||[]).forEach(s => { const li = document.createElement('li'); li.textContent = s; ul.appendChild(li); });
+  t.appendChild(ul);
+  if(o.top && o.top.length){
+    const tp = document.createElement('div'); tp.className = 'ovl-top';
+    tp.textContent = 'Using the most RAM: ' + o.top.map(x => `${x.name} ${x.gb} GB`).join(' · ')
+      + (o.before !== null && o.before !== undefined ? ` · RAM was ${o.before}% full before the model started` : '');
+    t.appendChild(tp);
+  }
+  b.style.display = 'flex';
+}
+async function ovlOk(){
+  document.getElementById('ovl-banner').style.display = 'none';
+  try{ await fetch('/api/activity/cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({what:'overload'})}); }catch(e){}
+}
+function ovlFix(){ try{ openCat('model'); }catch(e){} }
+
 // ── Update notice (s32_update): "System 32 vX is available — Update?" ──
 let _upd = null;
 async function updPoll(){
@@ -3965,12 +4118,6 @@ async function updPoll(){
       document.getElementById('upd-text').textContent = `System 32 ${s.available} is available (you have ${s.current}).`;
       document.getElementById('upd-notes').textContent = s.notes || 'No notes for this release.';
       document.getElementById('upd-btns').style.display = 'inline-flex';
-      document.getElementById('upd-roll').style.display = 'none';
-      b.style.display = 'flex';
-    } else if(s.updated_from && s.rollback && !window._updSeen){
-      document.getElementById('upd-text').textContent = `Updated to ${s.current} (from ${s.updated_from}).`;
-      document.getElementById('upd-btns').style.display = 'none';
-      document.getElementById('upd-roll').style.display = 'inline-flex';
       b.style.display = 'flex';
     } else if(!window._updWorking){
       b.style.display = 'none';
@@ -3990,7 +4137,6 @@ async function updLater(){
 function _updWaitForRestart(msg){
   document.getElementById('upd-text').textContent = msg;
   document.getElementById('upd-btns').style.display = 'none';
-  document.getElementById('upd-roll').style.display = 'none';
   setTimeout(function again(){
     fetch('/status').then(r=>{ if(r.ok) location.reload(); else setTimeout(again, 3000); })
                     .catch(()=>setTimeout(again, 3000));
@@ -3998,7 +4144,7 @@ function _updWaitForRestart(msg){
 }
 async function updApply(){
   if(!_upd) return;
-  if(!confirm(`Update System 32 to ${_upd.available}?\n\nOnly System 32's own program files are replaced — your memories, settings, outputs and models stay as they are. The current files are kept so you can roll back. System 32 restarts by itself.`)) return;
+  if(!confirm(`Update System 32 to ${_upd.available}?\n\nOnly System 32's own program files are replaced — your memories, settings, outputs and models stay as they are. Earlier versions stay available in the CHANGELOG (DATA · SAVE · RESET). System 32 restarts by itself.`)) return;
   window._updWorking = true;
   document.getElementById('upd-text').textContent = `Updating to ${_upd.available}…`;
   document.getElementById('upd-btns').style.display = 'none';
@@ -4008,14 +4154,52 @@ async function updApply(){
     else { window._updWorking = false; document.getElementById('upd-text').textContent = j.error || 'The update did not install.'; document.getElementById('upd-btns').style.display = 'inline-flex'; }
   }catch(e){ window._updWorking = false; document.getElementById('upd-text').textContent = 'The update did not install: ' + e; }
 }
-async function updRollback(){
-  if(!confirm('Roll back to the version you had before this update? System 32 restarts by itself.')) return;
-  window._updWorking = true;
+// ── Changelog (DATA · SAVE · RESET) — the last three releases from GitHub (2026-11-07) ──
+async function loadChangelog(refresh){
+  const list = document.getElementById('chlog-list'), st = document.getElementById('chlog-status');
+  if(!list) return;
+  st.textContent = 'Reading the releases from GitHub…';
+  let d;
+  try{ d = await fetch('/api/update/releases' + (refresh ? '?refresh=1' : '')).then(r=>r.json()); }
+  catch(e){ st.textContent = 'Couldn\'t reach System 32.'; return; }
+  list.innerHTML = '';
+  if(d.current) document.getElementById('chlog-ver').textContent = 'you have ' + d.current;
+  if(d.error){ st.textContent = d.error; return; }
+  st.textContent = '';
+  const rel = d.releases || [];
+  if(!rel.length){ st.textContent = 'No releases published yet.'; return; }
+  rel.forEach(r => {
+    const item = document.createElement('div'); item.className = 'chlog-item';
+    const row = document.createElement('div'); row.className = 'chlog-row';
+    const v = document.createElement('span'); v.className = 'v'; v.textContent = r.version; row.appendChild(v);
+    const dt = document.createElement('span'); dt.className = 'd'; dt.textContent = r.date || ''; row.appendChild(dt);
+    if(r.installed){ const tg = document.createElement('span'); tg.className = 'tag'; tg.textContent = 'installed'; row.appendChild(tg); }
+    else {
+      const b = document.createElement('button');
+      b.textContent = r.newer ? 'Update' : 'Roll back'; if(r.newer) b.className = 'new';
+      b.onclick = () => chlogInstall(r, b);
+      row.appendChild(b);
+    }
+    item.appendChild(row);
+    const det = document.createElement('details');             // collapsed by default
+    const sm = document.createElement('summary'); sm.textContent = 'What changed'; det.appendChild(sm);
+    const pre = document.createElement('pre'); pre.textContent = r.notes || 'No notes for this release.'; det.appendChild(pre);
+    item.appendChild(det);
+    list.appendChild(item);
+  });
+}
+async function chlogInstall(r, btn){
+  const word = r.newer ? 'Update' : 'Roll back';
+  if(!confirm(`${word} System 32 to ${r.version}?\n\nVersion ${r.version} is downloaded from GitHub and replaces System 32's own program files. Your memories, settings, outputs and models aren't touched. System 32 restarts by itself.`
+      + (r.newer ? '' : `\n\nYou can come back to the newest version the same way, from this list or the update notice.`))) return;
+  const st = document.getElementById('chlog-status');
+  st.textContent = `Downloading ${r.version}…`;
+  document.querySelectorAll('#chlog-list button').forEach(b => b.disabled = true);
   try{
-    const j = await fetch('/api/update/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}).then(r=>r.json());
-    if(j.ok) _updWaitForRestart(`Rolled back to ${j.version} — restarting…`);
-    else { window._updWorking = false; alert(j.error || 'Roll back failed.'); }
-  }catch(e){ window._updWorking = false; }
+    const j = await fetch('/api/update/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({version:r.version})}).then(x=>x.json());
+    if(j.ok){ st.textContent = `Installed ${j.version} — restarting…`; _updWaitForRestart(`${word === 'Update' ? 'Updated' : 'Rolled back'} to ${j.version} — restarting…`); }
+    else { st.textContent = j.error || 'It didn\'t install.'; document.querySelectorAll('#chlog-list button').forEach(b => b.disabled = false); }
+  }catch(e){ st.textContent = 'It didn\'t install: ' + e; document.querySelectorAll('#chlog-list button').forEach(b => b.disabled = false); }
 }
 setInterval(updPoll, 300000); setTimeout(updPoll, 3000);
 
@@ -4460,12 +4644,13 @@ function _fmtB(n){
 async function pollDownloads(){
   let d;
   try{ d = await fetch('/api/downloads').then(r=>r.json()); }catch(e){ return; }
+  _showOverload(d.overload || null);
   const act = d.active||[], q = d.queued||[], bt = d.batch||null;
   // Model loading / system prompt refresh share the bar (2026-11-02). The model comes
   // first (nothing can be asked until it's up); the prompt refresh only when nothing else shows.
   const ld = d.loading||null;
   const busy = act.length>0 || q.length>0 || !!d.restarting || !!bt;
-  const lshow = ld && (ld.kind==='model' || !busy) ? ld : null;
+  const lshow = ld && (ld.kind==='model' || ld.kind==='scan' || !busy) ? ld : null;
   const on = busy || !!lshow;
   const xb = document.getElementById('dl-x');
   const bar=document.getElementById('dl-bar'), fill=document.getElementById('dl-fill'),
@@ -4495,7 +4680,7 @@ async function pollDownloads(){
     }
     // ✕ cancels what the bar shows: downloads (+ queue) first, else its batch.
     // No ✕ mid-restart — stopping ComfyUI halfway would leave it down.
-    const what = lshow ? (lshow.kind==='model' ? 'model' : '') : (act.length||q.length) ? 'downloads' : (d.restarting ? '' : 'batch');
+    const what = lshow ? ((lshow.kind==='model' || lshow.kind==='scan') ? lshow.kind : '') : (act.length||q.length) ? 'downloads' : (d.restarting ? '' : 'batch');
     if(xb){ xb.style.display = what ? '' : 'none';
             if(xb.dataset.what !== what){ xb.dataset.what = what; xb.disabled = false; } }
     txt.textContent=label; bar.title=label;
@@ -4658,30 +4843,21 @@ function addThought(text, aiEl){
   }
   const d=document.createElement('details'); d.className='thought';
   const sm=document.createElement('summary');
-  sm.innerHTML='💭 thinking<span class="tsteps"></span> · <span class="tsum">summary after this turn…</span>';
+  // No summary line any more (2026-11-08): it cost a second model request after every
+  // reply, and the operator reads the thinking itself when he wants it.
+  sm.innerHTML='💭 thinking<span class="tsteps"></span>';
   const pre=document.createElement('pre'); pre.textContent=text;
   d.appendChild(sm); d.appendChild(pre);
   if(before) wrap.insertBefore(d, before); else wrap.appendChild(d);
-  const entry={el:sm.querySelector('.tsum'), steps:sm.querySelector('.tsteps'), pre, text, count:1, done:false};
+  const entry={steps:sm.querySelector('.tsteps'), pre, text, count:1, done:false};
   d._entry=entry;
   _pendingThoughts.push(entry);
   scroll();
 }
-async function summarizeThoughts(){
+function summarizeThoughts(){
+  // Just closes this turn's thoughts so the next turn starts its own. No model request.
   const todo=_pendingThoughts; _pendingThoughts=[];
-  for(const t of todo) t.done=true;           // a new turn never merges into these
-  if(document.body.classList.contains('hide-thoughts')){
-    // Thoughts are switched off — don't spend model time summarizing what isn't shown.
-    for(const t of todo) t.el.textContent='expand for the full reasoning';
-    return;
-  }
-  for(const t of todo){                       // one at a time — the model server has one slot
-    try{
-      const r=await fetch('/api/thought_summary',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({text:t.text})}).then(x=>x.json());
-      t.el.textContent=(r&&r.summary)?r.summary:'(no summary — expand for the full reasoning)';
-    }catch(e){ t.el.textContent='(summary unavailable — expand for the full reasoning)'; }
-  }
+  for(const t of todo) t.done=true;
 }
 
 function addTrace(text){
@@ -4705,7 +4881,10 @@ function _imgCell(im){
         cp.title='Copy the path — '+im.local;
         cp.onclick=(ev)=>{ ev.stopPropagation(); _copyPath(cp, im.local); };
         cell.appendChild(cp);
-        if(im.folder){ const f=document.createElement('span'); f.className='imgsrc'; f.textContent='📁 '+im.folder; f.title=im.local; cell.appendChild(f); } }
+        if(im.folder){ const f=document.createElement('span'); f.className='imgsrc imgdir'; f.textContent='📁 '+im.folder;
+          f.title='Open this folder — '+im.local;
+          f.onclick=(ev)=>{ ev.stopPropagation(); _openFolder(f, im.local); };
+          cell.appendChild(f); } }
       if(im.src){ const dl=document.createElement('button'); dl.className='imgdl'; dl.textContent='⬇';
         dl.title='Save to Output\\downloads\\images';
         dl.onclick=(ev)=>{ ev.stopPropagation(); _webSave(dl, {url:im.src, kind:'image', title:im.title||''}); };
@@ -4737,9 +4916,23 @@ function _vidCard(v){
       if(v.local){ dl.textContent='⧉ Copy path'; dl.title=v.local; dl.onclick=()=>_copyPath(dl, v.local); op.textContent='▶ Play'; }
       else { dl.textContent='⬇ Download'; dl.title='Save to Output\\downloads\\videos (asks first)';
         dl.onclick=()=>_webSave(dl, {url:v.url, kind:'video', title:v.title||''}, note); }
-      btns.appendChild(op); btns.appendChild(dl); body.appendChild(btns); body.appendChild(note);
+      btns.appendChild(op); btns.appendChild(dl);
+      if(v.local){ const of=document.createElement('button'); of.textContent='📂 Folder'; of.title='Open its folder — '+v.local;
+        of.onclick=()=>_openFolder(of, v.local); btns.appendChild(of); }
+      body.appendChild(btns); body.appendChild(note);
   card.appendChild(body);
   return card;
+}
+function _openFolder(el, p){
+  // Its folder in a new Explorer window, the file selected (a folder: opened) (2026-11-08).
+  fetch('/api/open_folder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:p})})
+    .then(r=>r.json()).then(d=>{
+      if(d && d.error){
+        // A small button just shows ⚠ (the reason in its tooltip); a label shows the reason.
+        const t=el.textContent, tt=el.title, small=el.tagName==='BUTTON';
+        el.textContent=small?'⚠':'⚠ '+d.error; if(small) el.title=d.error;
+        setTimeout(()=>{el.textContent=t; el.title=tt;},2500); }
+    }).catch(()=>{});
 }
 function _copyPath(btn, p){
   const done=()=>{ const t=btn.textContent; btn.textContent='✓ Copied'; setTimeout(()=>{btn.textContent=t;},1500); };
@@ -4761,7 +4954,11 @@ function _fileRow(r){
   main.appendChild(nm); main.appendChild(sub);
   const cp=document.createElement('button'); cp.className='fcopy'; cp.textContent='⧉'; cp.title='Copy the path';
   cp.onclick=()=>_copyPath(cp, r.path);
-  row.appendChild(ic); row.appendChild(main); row.appendChild(cp);
+  // 📂 opens it in Explorer (2026-11-08): a folder opens itself, a file opens its folder with it selected.
+  const of=document.createElement('button'); of.className='fcopy'; of.textContent='📂';
+  of.title=(r.kind==='folder'||r.count) ? 'Open this folder' : 'Open its folder';
+  of.onclick=()=>_openFolder(of, r.path);
+  row.appendChild(ic); row.appendChild(main); row.appendChild(of); row.appendChild(cp);
   return row;
 }
 // "More results" under an image grid / video cards (2026-10-29): the next batch of the SAME
@@ -5202,6 +5399,9 @@ async function send(){
             } else if(c.phase==='trace'){
               addTrace(c.text||'');
             } else if(c.phase==='thought'){
+              // The "Thinking…" bubble is for BEFORE the thought is done — it goes the
+              // moment the thought arrives, not when reply text starts (2026-11-08).
+              try{ th.remove(); }catch(_){}
               addThought(c.text||'', aiEl);
             }
           } catch(e){}
@@ -5512,7 +5712,7 @@ function openCat(key){
       refreshModelCurrent();
     } else if(key === 'identity'){ loadIdentityEditor(); }
     else if(key === 'voices'){ loadVoiceSelector(); loadMics(); loadVision(); }
-    else if(key === 'data'){ loadGameplay(); loadMemoryFileList(); refreshCurrentState(); }
+    else if(key === 'data'){ loadGameplay(); loadMemoryFileList(); refreshCurrentState(); loadChangelog(); }
     else if(key === 'dome'){ loadDome(); }
     else if(key === 'tuning'){ loadTuning(); }
     else if(key === 'ext'){ checkUnreal(); }
